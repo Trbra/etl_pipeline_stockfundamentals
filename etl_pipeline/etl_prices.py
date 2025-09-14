@@ -1,6 +1,5 @@
 import os
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
 import psycopg2
 import yfinance as yf
 import pandas as pd
@@ -16,40 +15,35 @@ DB_CONFIG = {
     'port': os.getenv("DB_PORT")
 }
 
-# === Helper functions ===
-def get_close_price(prices, target_date):
-    """
-    Return the closing price for the target_date.
-    If exact date is missing, return the last available price before the date.
-    """
-    past_data = prices.loc[:target_date]
-    if past_data.empty:
-        return None
-    return float(past_data.iloc[-1])
+# === Helper: Calculate RSI ===
+def compute_rsi(series: pd.Series, period: int = 14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
 
-def calc_change(prices, today_date, offset_days):
-    """Return % change between today and a past date (nearest available)."""
-    past_date = today_date - timedelta(days=offset_days)
-    today_price = get_close_price(prices, today_date)
-    past_price = get_close_price(prices, past_date)
+    # standard RSI: need period values before it becomes non-null
+    avg_gain = gain.rolling(window=period, min_periods=period).mean()
+    avg_loss = loss.rolling(window=period, min_periods=period).mean()
 
-    if today_price is not None and past_price is not None:
-        return round(((today_price - past_price) / past_price) * 100, 4)
-    return None
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
 def main():
     conn = psycopg2.connect(**DB_CONFIG)
     cur = conn.cursor()
 
+    # === Load tickers ===
     cur.execute("SELECT company_id, ticker FROM companies;")
     companies = cur.fetchall()
-    tickers = [t[1] for t in companies]  # list of all tickers
-    company_map = {t[1]: t[0] for t in companies}  # ticker -> company_id
+    tickers = [t[1] for t in companies]
+    company_map = {t[1]: t[0] for t in companies}
 
-    # --- Batch download all tickers ---
+    # --- Download today's prices (1 day) ---
     try:
         all_data = yf.download(
-            tickers, period="1y", interval="1d", progress=False, group_by='ticker', auto_adjust=False
+            tickers, period="1d", interval="1d",
+            progress=False, group_by='ticker', auto_adjust=False
         )
     except Exception as e:
         print(f"Batch download failed: {e}")
@@ -58,41 +52,104 @@ def main():
 
     for ticker in tickers:
         try:
-            df = all_data[ticker][['Close']].dropna()
-            if df.empty:
+            # handle case where group_by='ticker' produced multiindex columns
+            if ticker not in all_data.columns.levels[0]:
                 print(f"No data for {ticker}")
                 continue
 
-            df.index = pd.to_datetime(df.index.date)  # normalize dates
-            prices = df['Close']
+            df = all_data[ticker][['Close', 'Volume']].dropna()
+            if df.empty:
+                print(f"No price data for {ticker}")
+                continue
 
-            today_date = prices.index[-1]
-            today_close = get_close_price(prices, today_date)
+            # normalize index to date (midnight) for consistent DB date keys
+            df.index = pd.to_datetime(df.index.date)
 
-            # calculate changes
-            change_1m = calc_change(prices, today_date, 30)
-            change_3m = calc_change(prices, today_date, 90)
-            change_6m = calc_change(prices, today_date, 180)
-            change_1y = calc_change(prices, today_date, 364)
+            # === Insert today's price(s) into prices table ===
+            inserted_dates = []
+            for date, row in df.iterrows():
+                try:
+                    cur.execute("""
+                        INSERT INTO prices (company_id, price_date, close_price, volume)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (company_id, price_date) DO UPDATE
+                        SET close_price = EXCLUDED.close_price,
+                            volume = EXCLUDED.volume;
+                    """, (company_map[ticker], date, float(row['Close']), int(row['Volume'])))
+                    inserted_dates.append(pd.to_datetime(date))
+                except Exception as e:
+                    # keep going if one date fails
+                    print(f"Failed to insert price for {ticker} on {date}: {e}")
 
+            # commit so the newly inserted prices are available for the subsequent SELECT
+            conn.commit()
 
-            # insert/update prices
+            if not inserted_dates:
+                print(f"No new/updated price rows inserted for {ticker}")
+                continue
+
+            # --- Pull recent history from DB (including today) to compute indicators ---
             cur.execute("""
-                INSERT INTO prices (
-                    company_id, price_date, close_price, change_1m, change_3m, change_6m, change_1y
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (company_id, price_date) DO UPDATE
-                SET close_price = EXCLUDED.close_price,
-                    change_1m = EXCLUDED.change_1m,
-                    change_3m = EXCLUDED.change_3m,
-                    change_6m = EXCLUDED.change_6m,
-                    change_1y = EXCLUDED.change_1y;
-            """, (
-                company_map[ticker], today_date, today_close,
-                change_1m, change_3m, change_6m, change_1y
-            ))
+                SELECT price_date, close_price, volume
+                FROM prices
+                WHERE company_id = %s
+                ORDER BY price_date DESC
+                LIMIT 500
+            """, (company_map[ticker],))
+            rows = cur.fetchall()
 
-            print(f"Updated prices for {ticker} ({today_date})")
+            if not rows:
+                print(f"No historical prices found in DB for {ticker}")
+                continue
+
+            hist_df = pd.DataFrame(rows, columns=['price_date', 'Close', 'Volume'])
+            # ensure datetime index and ascending order for rolling calculations
+            hist_df['price_date'] = pd.to_datetime(hist_df['price_date'])
+            hist_df.set_index('price_date', inplace=True)
+            hist_df.sort_index(inplace=True)
+
+            # === Calculate metrics on DB history (so we have enough lookback) ===
+            hist_df['ma50'] = hist_df['Close'].rolling(window=50, min_periods=50).mean()
+            hist_df['ma200'] = hist_df['Close'].rolling(window=200, min_periods=200).mean()
+            hist_df['rsi14'] = compute_rsi(hist_df['Close'], 14)
+
+            # === Insert metrics only for the date(s) we just inserted/updated from Yahoo ===
+            for dt in inserted_dates:
+                # normalize dt to match index dtype (Timestamp)
+                dt_ts = pd.to_datetime(dt)
+
+                if dt_ts not in hist_df.index:
+                    # possible if DB stores different timezone / date format - try matching by date portion
+                    matches = hist_df[hist_df.index.normalize() == dt_ts.normalize()]
+                    if matches.empty:
+                        print(f"No matching historical row for {ticker} on {dt_ts.date()}, skipping metrics insert")
+                        continue
+                    metrics_row = matches.iloc[-1]
+                    metrics_date = matches.index[-1]
+                else:
+                    metrics_row = hist_df.loc[dt_ts]
+                    metrics_date = dt_ts
+
+                ma50 = float(metrics_row['ma50']) if not pd.isna(metrics_row['ma50']) else None
+                ma200 = float(metrics_row['ma200']) if not pd.isna(metrics_row['ma200']) else None
+                rsi14 = float(metrics_row['rsi14']) if not pd.isna(metrics_row['rsi14']) else None
+
+                try:
+                    cur.execute("""
+                        INSERT INTO metrics (company_id, price_date, ma50, ma200, rsi14)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (company_id, price_date) DO UPDATE
+                        SET ma50 = EXCLUDED.ma50,
+                            ma200 = EXCLUDED.ma200,
+                            rsi14 = EXCLUDED.rsi14
+                    """, (
+                        company_map[ticker], metrics_date,
+                        ma50, ma200, rsi14
+                    ))
+                except Exception as e:
+                    print(f"Failed to insert metrics for {ticker} on {metrics_date}: {e}")
+
+            print(f"Inserted/updated {len(inserted_dates)} price(s) and metrics for {ticker}")
 
         except Exception as e:
             print(f"Error processing {ticker}: {e}")
@@ -100,7 +157,12 @@ def main():
     conn.commit()
     cur.close()
     conn.close()
-    print("All prices updated successfully.")
+    print("All prices & metrics updated successfully.")
 
 if __name__ == "__main__":
     main()
+
+
+
+
+

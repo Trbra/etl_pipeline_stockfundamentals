@@ -42,6 +42,12 @@ def insertData(cur, conn, ticker, max_retries=3, delay=5):
             forward_eps = info.get("forwardEps")
             dividend_yield = info.get("dividendYield")
 
+            revenue = info.get("totalRevenue")
+            net_income = info.get("netIncomeToCommon")
+            free_cash_flow = info.get("freeCashflow")
+            debt_to_equity = info.get("debtToEquity")
+            roe = info.get("returnOnEquity")
+
             pe_ratio = None
             try:
                 pe_ratio = info.get("currentPrice") / trailing_eps if trailing_eps else None
@@ -53,8 +59,8 @@ def insertData(cur, conn, ticker, max_retries=3, delay=5):
                 cur.execute("""
                     INSERT INTO companies (ticker, name, sector, industry)
                     VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (ticker) DO UPDATE SET
-                        name = EXCLUDED.name,
+                    ON CONFLICT (ticker) DO UPDATE
+                    SET name = EXCLUDED.name,
                         sector = EXCLUDED.sector,
                         industry = EXCLUDED.industry
                     RETURNING company_id;
@@ -71,15 +77,38 @@ def insertData(cur, conn, ticker, max_retries=3, delay=5):
                 cur.execute("""
                     INSERT INTO fundamentals (company_id, report_date, market_cap, pe_ratio, trailing_eps, forward_eps, dividend_yield)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (company_id, report_date) DO NOTHING;
+                    ON CONFLICT (company_id, report_date) DO UPDATE
+                    SET market_cap = EXCLUDED.market_cap,
+                        pe_ratio = EXCLUDED.pe_ratio,
+                        trailing_eps = EXCLUDED.trailing_eps,
+                        forward_eps = EXCLUDED.forward_eps,
+                        dividend_yield = EXCLUDED.dividend_yield;
                 """, (company_id, report_date, market_cap, pe_ratio, trailing_eps, forward_eps, dividend_yield))
                 conn.commit()
                 logging.info(f"Inserted fundamentals for {ticker}")
             except Exception as e:
                 conn.rollback()
-                logging.error(f"Fundamentals insert failed for {ticker}: {e}")
+                logging.error(f"Fundamentals insert/update failed for {ticker}: {e}")
 
-            return  # Success
+
+            try:
+                cur.execute("""
+                    INSERT INTO financials (company_id, report_date, revenue, net_income, free_cash_flow, debt_to_equity, roe)
+                    VALUES ( %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (company_id, report_date) DO UPDATE
+                    SET revenue = EXCLUDED.revenue,
+                        net_income = EXCLUDED.net_income,
+                        free_cash_flow = EXCLUDED.free_cash_flow,
+                        debt_to_equity = EXCLUDED.debt_to_equity,
+                        roe = EXCLUDED.roe;
+                """, (company_id, report_date, revenue, net_income, free_cash_flow, debt_to_equity, roe))
+                conn.commit()
+                logging.info(f"Inserted financials for {ticker}")
+            except Exception as e:
+                conn.rollback()
+                logging.error(f"Financials insert/update failed for {ticker}: {e}")
+
+            return # Success
 
         except Exception as e:
             logging.warning(f"Attempt {attempt} failed for {ticker}: {e}")
@@ -121,4 +150,6 @@ finally:
     logging.info("Database connection closed")
 
 logging.info("Process Complete")
+
+
 

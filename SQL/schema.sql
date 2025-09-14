@@ -8,7 +8,7 @@ CREATE TABLE companies (
 
 CREATE TABLE fundamentals (
     fundamental_id SERIAL PRIMARY KEY,
-    company_id INT REFERENCES companies(company_ID),
+    company_id INT REFERENCES companies(company_ID) ON DELETE CASCADE,
     report_date DATE,
     market_cap BIGINT,
     pe_ratio FLOAT,
@@ -23,14 +23,33 @@ CREATE TABLE prices (
     company_id INT REFERENCES companies(company_id) ON DELETE CASCADE,
     price_date DATE NOT NULL,
     close_price NUMERIC(12,4) NOT NULL,
-    change_1m NUMERIC(8,4),
-    change_3m NUMERIC(8,4),
-    change_6m NUMERIC(8,4),
-    change_1y NUMERIC(8,4),
+	volume BIGINT,
     created_at TIMESTAMP DEFAULT NOW(),
     CONSTRAINT uq_company_date UNIQUE (company_id, price_date)
 );
 
+CREATE TABLE financials (
+    financial_id SERIAL PRIMARY KEY,
+    company_id INT REFERENCES companies(company_id) ON DELETE CASCADE,
+    report_date DATE NOT NULL,
+    revenue BIGINT,
+    net_income BIGINT,
+    free_cash_flow BIGINT,
+    debt_to_equity FLOAT,
+    roe FLOAT,
+	volume BIGINT,
+    CONSTRAINT uq_financials_company_date UNIQUE (company_id, report_date)
+);
+
+CREATE TABLE metrics (
+    metric_id SERIAL PRIMARY KEY,
+    company_id INT REFERENCES companies(company_id) ON DELETE CASCADE,
+    price_date DATE NOT NULL,
+    ma50 NUMERIC(12,4),
+    ma200 NUMERIC(12,4),
+    rsi14 NUMERIC(6,2),
+    CONSTRAINT uq_metrics UNIQUE (company_id, price_date)
+);
 
 
 
