@@ -1,48 +1,63 @@
-from datetime import date
+import os
 import logging
 import psycopg2
 from dotenv import load_dotenv
-import os
 
-# --- Load environment ---
 load_dotenv()
 
 DB_CONFIG = {
-    'dbname': os.getenv("DB_NAME"),
-    'user': os.getenv("DB_USER"),
-    'password': os.getenv("DB_PASSWORD"),
-    'host': os.getenv("DB_HOST"),
-    'port': os.getenv("DB_PORT")
+    "dbname": os.getenv("DB_NAME"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "host": os.getenv("DB_HOST"),
+    "port": os.getenv("DB_PORT"),
 }
 
-# --- Configure logging ---
 logging.basicConfig(
-    filename='data_freshness.log',
+    filename="data_retention.log",
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-try:
+# Tune these to your storage preference
+KEEP_PRICE_DAYS = 730        # ~2 years
+KEEP_FUNDAMENTAL_YEARS = 3   # ~3 years
+
+
+def main():
     with psycopg2.connect(**DB_CONFIG) as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                DELETE FROM companies c
-                USING fundamentals f
-                WHERE c.company_id = f.company_id
-                  AND f.report_date <= CURRENT_DATE - INTERVAL '90 days'
-                RETURNING c.ticker;
-            """)
-            deleted = cur.fetchall()
+            cur.execute(
+                "DELETE FROM metrics WHERE price_date < CURRENT_DATE - INTERVAL %s;",
+                (f"{KEEP_PRICE_DAYS} days",),
+            )
+            metrics_deleted = cur.rowcount
+
+            cur.execute(
+                "DELETE FROM prices WHERE price_date < CURRENT_DATE - INTERVAL %s;",
+                (f"{KEEP_PRICE_DAYS} days",),
+            )
+            prices_deleted = cur.rowcount
+
+            cur.execute(
+                "DELETE FROM fundamentals WHERE report_date < CURRENT_DATE - INTERVAL %s;",
+                (f"{KEEP_FUNDAMENTAL_YEARS} years",),
+            )
+            fundamentals_deleted = cur.rowcount
+
+            cur.execute(
+                "DELETE FROM financials WHERE report_date < CURRENT_DATE - INTERVAL %s;",
+                (f"{KEEP_FUNDAMENTAL_YEARS} years",),
+            )
+            financials_deleted = cur.rowcount
+
             conn.commit()
 
-            if deleted:
-                tickers = [row[0] for row in deleted]
-                logging.info(f"Deleted {len(tickers)} companies: {', '.join(tickers)}")
-            else:
-                logging.info("No companies deleted (all are up to date).")
+    logging.info(
+        f"Retention done. Deleted prices={prices_deleted}, metrics={metrics_deleted}, "
+        f"fundamentals={fundamentals_deleted}, financials={financials_deleted}"
+    )
 
-except Exception as e:
-    logging.error(f"Database operation failed: {e}")
 
-finally:
-    logging.info("Database cleanup finished.")
+if __name__ == "__main__":
+    main()
