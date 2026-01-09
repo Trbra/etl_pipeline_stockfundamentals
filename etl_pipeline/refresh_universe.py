@@ -1,7 +1,7 @@
 import io
 import os
 import logging
-from datetime import date, datetime
+from datetime import date
 
 import pandas as pd
 import psycopg2
@@ -30,27 +30,103 @@ WIKI_TSX60 = "https://en.wikipedia.org/wiki/S%26P/TSX_60"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
-def _fetch_table(url: str) -> pd.DataFrame:
+def _fetch_wiki_html_tables(url: str) -> list[pd.DataFrame]:
+    """
+    Fetches and parses all HTML tables from a Wikipedia page.
+    Returns a list of DataFrames (possibly empty).
+    """
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
     tables = pd.read_html(io.StringIO(r.text))
-    if not tables:
-        raise ValueError(f"No tables found at {url}")
-    return tables[0]
+    # Normalize column names (strip whitespace)
+    for t in tables:
+        t.columns = [str(c).strip() for c in t.columns]
+    return tables
+
+
+def _pick_table_by_columns(tables: list[pd.DataFrame], required_cols: set[str], url: str) -> pd.DataFrame:
+    """
+    Picks the first table that contains all required columns.
+    Raises a KeyError with helpful debug output if not found.
+    """
+    for t in tables:
+        if required_cols.issubset(set(t.columns)):
+            return t
+
+    sample_cols = [list(t.columns) for t in tables[:8]]
+    raise KeyError(
+        f"Could not find required columns {sorted(required_cols)} at {url}. "
+        f"Example table columns (first {len(sample_cols)} tables): {sample_cols}"
+    )
+
+
+def _extract_symbol_series(df: pd.DataFrame) -> pd.Series:
+    """
+    Returns the best-guess symbol column from a wikipedia constituents table.
+    Supports common variants: Symbol / Ticker / S&amp;P 500 Symbol, etc.
+    """
+    # Build a map of lower->actual
+    col_map = {str(c).strip().lower(): c for c in df.columns}
+
+    candidates = [
+        "symbol",
+        "ticker",
+        "s&p 500 symbol",
+        "s&p/tsx 60 symbol",
+        "tsx symbol",
+        "sp500 symbol",
+    ]
+    for c in candidates:
+        if c in col_map:
+            return df[col_map[c]]
+
+    raise KeyError(f"No Symbol/Ticker-like column found. Columns: {list(df.columns)}")
 
 
 def fetch_sp500_symbols() -> list[str]:
-    df = _fetch_table(WIKI_SP500)
-    # Wikipedia table uses "Symbol"
-    symbols = df["Symbol"].astype(str).str.strip().tolist()
-    return [s for s in symbols if s and s != "nan"]
+    tables = _fetch_wiki_html_tables(WIKI_SP500)
+
+    # Prefer tables that actually have Symbol
+    try:
+        df = _pick_table_by_columns(tables, {"Symbol"}, WIKI_SP500)
+        sym = df["Symbol"]
+    except KeyError:
+        # Fallback: find any plausible symbol/ticker column
+        df = tables[0] if tables else pd.DataFrame()
+        sym = _extract_symbol_series(df) if not df.empty else pd.Series([], dtype=str)
+
+    symbols = sym.astype(str).str.strip()
+    # Remove blanks / nan text / footnote artifacts
+    symbols = symbols[symbols.notna() & (symbols != "") & (symbols.str.lower() != "nan")]
+    return symbols.tolist()
 
 
 def fetch_tsx60_symbols() -> list[str]:
-    df = _fetch_table(WIKI_TSX60)
-    # Constituents table uses "Symbol"
-    symbols = df["Symbol"].astype(str).str.strip().tolist()
-    return [s for s in symbols if s and s != "nan"]
+    tables = _fetch_wiki_html_tables(WIKI_TSX60)
+
+    # TSX60 page sometimes changes table ordering; pick by columns, not index.
+    try:
+        df = _pick_table_by_columns(tables, {"Symbol"}, WIKI_TSX60)
+        sym = df["Symbol"]
+    except KeyError:
+        # Fallback: scan all tables for a symbol-like column
+        sym = None
+        for t in tables:
+            try:
+                sym = _extract_symbol_series(t)
+                break
+            except KeyError:
+                continue
+        if sym is None:
+            # Provide helpful debug context
+            sample_cols = [list(t.columns) for t in tables[:8]]
+            raise KeyError(
+                f"Could not locate TSX60 Symbol column. Example table columns: {sample_cols}"
+            )
+
+    symbols = sym.astype(str).str.strip()
+    symbols = symbols[symbols.notna() & (symbols != "") & (symbols.str.lower() != "nan")]
+    return symbols.tolist()
 
 
 def normalize_yfinance_symbol(raw: str, universe_code: str) -> tuple[str, str, str]:
@@ -59,8 +135,7 @@ def normalize_yfinance_symbol(raw: str, universe_code: str) -> tuple[str, str, s
     """
     raw = raw.strip()
 
-    # Common US dot-ticker conversions for Yahoo
-    # (You can extend as you discover more)
+    # Common US dot-ticker conversions for Yahoo Finance
     dot_to_dash = {
         "BRK.B": "BRK-B",
         "BF.B": "BF-B",
@@ -104,7 +179,7 @@ def upsert_ticker_map(cur, ticker_raw: str, ticker_yf: str, exchange: str, curre
 
 def insert_membership_snapshot(cur, universe_code: str, as_of: date, tickers: list[str]):
     rows = [(universe_code, as_of, t, "wikipedia", True) for t in tickers]
-    # Avoid per-row INSERT loops (fast)
+
     from psycopg2.extras import execute_values
 
     execute_values(
