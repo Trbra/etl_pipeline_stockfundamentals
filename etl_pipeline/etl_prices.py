@@ -48,6 +48,90 @@ def fetch_active_universe(cur, as_of: dt_date) -> list[tuple[int, str, str]]:
     return cur.fetchall()
 
 
+def tsx_dash_fallback(yf_symbol: str) -> str | None:
+    """
+    If a TSX symbol uses dot-class notation, Yahoo sometimes expects dash notation.
+    Examples:
+      CCL.B.TO -> CCL-B.TO
+      BIP.UN.TO -> BIP-UN.TO
+    Returns a fallback symbol or None if no transformation applies.
+    """
+    if not yf_symbol.endswith(".TO"):
+        return None
+
+    base = yf_symbol[:-3]  # strip ".TO"
+    if "." not in base:
+        return None
+
+    alt_base = base.replace(".", "-")
+    alt = f"{alt_base}.TO"
+    return alt if alt != yf_symbol else None
+
+
+def _coerce_download_to_ohlcv(df: pd.DataFrame, yf_symbol: str) -> pd.DataFrame:
+    """
+    yfinance can return either:
+      - SingleIndex columns: Open, High, Low, Close, Adj Close, Volume
+      - MultiIndex columns: (TICKER, Open), (TICKER, Close), ...
+    This function returns a frame with columns ['Close', 'Volume'].
+    """
+    if df is None or df.empty:
+        raise ValueError("Empty download dataframe")
+
+    # Handle MultiIndex (common when group_by='ticker' OR even sometimes in general)
+    if isinstance(df.columns, pd.MultiIndex):
+        # Typical case: top level = ticker
+        if yf_symbol in df.columns.get_level_values(0):
+            df = df[yf_symbol]
+        else:
+            # Sometimes the ticker isn't exactly matched (rare), fallback: pick first ticker group
+            first_ticker = df.columns.get_level_values(0)[0]
+            df = df[first_ticker]
+
+    # Now expect flat columns
+    cols = [c.strip() for c in df.columns.astype(str).tolist()]
+    df.columns = cols
+
+    if "Close" not in df.columns:
+        raise ValueError(f"Missing Close column. Columns: {df.columns.tolist()}")
+
+    out = df[["Close", "Volume"]] if "Volume" in df.columns else df[["Close"]].copy()
+    out = out.dropna(subset=["Close"])
+    if out.empty:
+        raise ValueError("No close price rows after dropna")
+    if "Volume" not in out.columns:
+        out["Volume"] = None
+    return out
+
+
+def download_one_symbol(yf_symbol: str, period: str = "7d") -> pd.DataFrame:
+    """
+    Download a single ticker's daily OHLCV frame and return Close/Volume only.
+    Handles both single-index and multi-index columns.
+    """
+    df = yf.download(
+        yf_symbol,
+        period=period,
+        interval="1d",
+        progress=False,
+        auto_adjust=False,
+        group_by="ticker",  # OK now that we handle MultiIndex
+    )
+    return _coerce_download_to_ohlcv(df, yf_symbol)
+
+
+def update_ticker_map(cur, ticker_raw: str, new_ticker_yf: str):
+    cur.execute(
+        """
+        UPDATE ticker_map
+        SET ticker_yf = %s,
+            updated_at = NOW()
+        WHERE ticker_raw = %s;
+        """,
+        (new_ticker_yf, ticker_raw),
+    )
+
+
 def main():
     as_of = dt_date.today()
 
@@ -61,46 +145,36 @@ def main():
         conn.close()
         return
 
-    # Download in batch using yfinance tickers
-    yf_tickers = [row[2] for row in universe_rows]
-
-    try:
-        all_data = yf.download(
-            yf_tickers,
-            period="7d",          # safer than 1d (covers weekends/holidays)
-            interval="1d",
-            progress=False,
-            group_by="ticker",
-            auto_adjust=False
-        )
-    except Exception as e:
-        print(f"Batch download failed: {e}")
-        cur.close()
-        conn.close()
-        return
-
     # Map yfinance ticker -> (company_id, ticker_raw)
     yf_to_company = {row[2]: (row[0], row[1]) for row in universe_rows}
+    yf_tickers = list(yf_to_company.keys())
+
+    success = 0
+    failed = []
 
     for yf_sym in yf_tickers:
         company_id, ticker_raw = yf_to_company[yf_sym]
 
         try:
-            # yfinance returns multiindex columns when multiple tickers
-            if isinstance(all_data.columns, pd.MultiIndex):
-                if yf_sym not in all_data.columns.levels[0]:
-                    print(f"No data for {ticker_raw} ({yf_sym})")
-                    continue
-                df = all_data[yf_sym][["Close", "Volume"]].dropna()
-            else:
-                # single ticker case
-                df = all_data[["Close", "Volume"]].dropna()
+            # Try primary symbol first
+            try:
+                df = download_one_symbol(yf_sym, period="7d")
+                used_symbol = yf_sym
+            except Exception as primary_err:
+                # If TSX-style dot notation, try dash fallback
+                alt = tsx_dash_fallback(yf_sym)
+                if not alt:
+                    raise primary_err
 
-            if df.empty:
-                print(f"No price data for {ticker_raw} ({yf_sym})")
-                continue
+                df = download_one_symbol(alt, period="7d")
+                used_symbol = alt
 
-            # normalize to date keys
+                # Persist the working Yahoo symbol so next run is cheaper
+                update_ticker_map(cur, ticker_raw, used_symbol)
+                conn.commit()
+                print(f"[MAP FIX] {ticker_raw}: {yf_sym} -> {used_symbol}")
+
+            # Normalize index to DATE (midnight) for consistent DB keys
             df.index = pd.to_datetime(df.index.date)
 
             inserted_dates = []
@@ -174,15 +248,22 @@ def main():
                 )
 
             conn.commit()
-            print(f"Updated prices+metrics for {ticker_raw} ({yf_sym}) [{len(inserted_dates)} day(s)]")
+            print(f"Updated prices+metrics for {ticker_raw} ({used_symbol}) [{len(inserted_dates)} day(s)]")
+            success += 1
 
         except Exception as e:
             conn.rollback()
-            print(f"Error processing {ticker_raw} ({yf_sym}): {e}")
+            failed.append((ticker_raw, yf_sym, str(e)))
+            print(f"FAILED {ticker_raw} ({yf_sym}): {e}")
 
     cur.close()
     conn.close()
-    print("All prices & metrics updated successfully.")
+
+    print(f"\nDone. Success={success} Failed={len(failed)}")
+    if failed:
+        print("Failures:")
+        for fr in failed:
+            print(" -", fr)
 
 
 if __name__ == "__main__":

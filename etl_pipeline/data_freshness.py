@@ -14,7 +14,7 @@ DB_CONFIG = {
 }
 
 logging.basicConfig(
-    filename="data_retention.log",
+    filename="data_freshness.log",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
@@ -54,7 +54,7 @@ def main():
             conn.commit()
 
     logging.info(
-        f"Retention done. Deleted prices={prices_deleted}, metrics={metrics_deleted}, "
+        f"freshness done. Deleted prices={prices_deleted}, metrics={metrics_deleted}, "
         f"fundamentals={fundamentals_deleted}, financials={financials_deleted}"
     )
 
