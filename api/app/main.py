@@ -341,6 +341,16 @@ async def update_ranking_config(cfg: RankingConfig):
 # -------------------------
 # Screener API
 # -------------------------
+
+@app.get("/")
+async def root():
+    return {
+        "service": "Market Screener API",
+        "ok": True,
+        "docs": "/docs",
+        "health": "/health",
+    }
+
 @app.get("/api/screener", response_model=List[ScreenerRow])
 async def screener(
     q: Optional[str] = None,
