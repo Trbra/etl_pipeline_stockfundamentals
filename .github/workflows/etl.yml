@@ -31,7 +31,7 @@ jobs:
           PIPELINE_LOG_FILE: run_pipeline.log
           PIPELINE_CWD: .
         run: |
-          python run_pipeline.py --cwd .
+          python etl/run_pipeline.py 2>&1 | tee run_pipeline.log
 
       - name: Upload log artifact
         if: always()
