@@ -4,7 +4,6 @@
 *data_freshness.log
 *etl_fundamentals.log
 *node_modules/
-*package.json
 *package-lock.json
 *.next/
 *__pycache__/
