@@ -2,7 +2,7 @@
 
 import { useMemo, Fragment, useState } from "react";
 import CompareLegend from "./CompareLegend";
-import InfoTooltip from "./InfoTooltip";
+import InfoTooltip from "./InfoToolTip";
 import {
   ResponsiveContainer,
   LineChart,
