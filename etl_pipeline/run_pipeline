@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+import psycopg2
+
+"""Run the ETL pipeline steps in sequence and record run metadata.
+
+This script orchestrates the project pipeline by running a sequence of
+per-step Python scripts (refreshing the universe, fetching fundamentals,
+loading prices, and transferring to the warehouse). It records run and
+step status information in `warehouse.etl_runs` so the pipeline can be
+monitored and audited.
+
+Typical usage: `python run_pipeline --steps refresh_universe etl_prices`
+Configuration is via environment variables (DATABASE_URL or DB_*/PIPELINE_*).
+"""
+
+
+DEFAULT_STEPS = [
+    "refresh_universe",
+    "fundamentals_pipeline",
+    "etl_prices",
+    "warehouse_transfer",
+]
+
+STEP_TO_SCRIPT = {
+    "refresh_universe": "refresh_universe.py",
+    "fundamentals_pipeline": "fundamentals_pipeline.py",
+    "etl_prices": "etl_prices.py",
+    "warehouse_transfer": "warehouse_transfer.py",
+}
+
+# --- Logging and utility helpers -------------------------------------------------
+
+
+def setup_logging(level: str, log_file: str) -> logging.Logger:
+    # Configure a logger that writes both to stdout and to a rotating file.
+    # Caller chooses the level and path via CLI flags or environment.
+    logger = logging.getLogger("pipeline")
+    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    return logger
+
+
+def get_database_url() -> str:
+    # Prefer `DATABASE_URL` if set, otherwise fall back to DB_* fragments.
+    url = os.getenv("DATABASE_URL")
+    if url and "://" in url:
+        return url
+
+    db_name = os.getenv("DB_NAME")
+    db_user = os.getenv("DB_USER")
+    db_password = os.getenv("DB_PASSWORD")
+    db_host = os.getenv("DB_HOST", "localhost")
+    db_port = os.getenv("DB_PORT", "5432")
+
+    if db_name and db_user and db_password:
+        return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+
+    return ""
+
+
+def run_python_script(
+    script_path: str,
+    *,
+    cwd: str,
+    env: Dict[str, str],
+    timeout_sec: int,
+    logger: logging.Logger,
+) -> Tuple[int, str, str]:
+    # Execute a child Python process for a pipeline step, capturing output.
+    # Returns (exit_code, stdout, stderr) and logs output appropriately.
+    cmd = [sys.executable, script_path]
+    logger.info(f"RUN: {' '.join(cmd)} (cwd={cwd})")
+
+    p = subprocess.run(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout_sec,
+    )
+
+    stdout = (p.stdout or "").strip()
+    stderr = (p.stderr or "").strip()
+
+    if stdout:
+        logger.info(stdout)
+    if stderr:
+        if p.returncode == 0:
+            logger.warning(stderr)
+        else:
+            logger.error(stderr)
+
+    return p.returncode, stdout, stderr
+
+
+def insert_run(conn, job_name: str, started_at: datetime) -> int:
+    # Insert a new row into `warehouse.etl_runs` to mark the start of a run.
+    # Returns the new `run_id` for subsequent updates.
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO warehouse.etl_runs (job_name, started_at, status, steps)
+            VALUES (%s, %s, 'running', '[]'::jsonb)
+            RETURNING run_id;
+            """,
+            (job_name, started_at),
+        )
+        run_id = cur.fetchone()[0]
+    conn.commit()
+    return int(run_id)
+
+
+def update_run(
+    conn,
+    run_id: int,
+    *,
+    status: str,
+    ended_at: Optional[datetime],
+    steps: List[Dict[str, Any]],
+    error: Optional[str],
+) -> None:
+    # Update the run row with current status, optional end time, the
+    # serialized steps log, and an optional error message.
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE warehouse.etl_runs
+            SET status = %s,
+                ended_at = %s,
+                steps = %s::jsonb,
+                error = %s
+            WHERE run_id = %s;
+            """,
+            (status, ended_at, json.dumps(steps), error, run_id),
+        )
+    conn.commit()
+
+
+def main() -> int:
+    # Parse CLI args and environment fallbacks for pipeline configuration.
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--steps", nargs="*", default=DEFAULT_STEPS, choices=DEFAULT_STEPS)
+    parser.add_argument("--cwd", default=os.getenv("PIPELINE_CWD", os.getcwd()))
+    parser.add_argument("--timeout-sec", type=int, default=int(os.getenv("PIPELINE_STEP_TIMEOUT_SEC", "3600")))
+    parser.add_argument("--job-name", default=os.getenv("PIPELINE_JOB_NAME", "daily_pipeline"))
+    parser.add_argument("--log-level", default=os.getenv("PIPELINE_LOG_LEVEL", "INFO"))
+    parser.add_argument("--log-file", default=os.getenv("PIPELINE_LOG_FILE", "run_pipeline.log"))
+    args = parser.parse_args()
+
+    logger = setup_logging(args.log_level, args.log_file)
+
+    # Resolve the DB connection URL from env vars.
+    database_url = get_database_url()
+    if not database_url:
+        logger.error("DATABASE_URL not set (and DB_* fallback not present).")
+        return 2
+
+    started_at = datetime.now(timezone.utc)
+    cwd = os.path.abspath(args.cwd)
+    logger.info(f"Pipeline start job_name={args.job_name} steps={args.steps} cwd={cwd}")
+
+    # Connection and run bookkeeping; `steps_log` accumulates per-step info.
+    conn: Optional[psycopg2.extensions.connection] = None
+    run_id: Optional[int] = None
+    steps_log: List[Dict[str, Any]] = []
+    fatal_error: Optional[str] = None
+    overall_ok = True
+
+    try:
+        conn = psycopg2.connect(database_url)
+        run_id = insert_run(conn, args.job_name, started_at)
+        logger.info(f"etl_runs run_id={run_id} started")
+    except Exception as e:
+        logger.warning(f"Could not write to warehouse.etl_runs: {e}")
+        conn = None
+        run_id = None
+
+    # Prepare the child process environment and ensure child scripts can
+    # access the database using the resolved `DATABASE_URL`.
+    child_env = dict(os.environ)
+    child_env["DATABASE_URL"] = database_url
+
+    for step in args.steps:
+        script = STEP_TO_SCRIPT[step]
+        # Resolve the script path: prefer stage-relative `cwd`, fallback
+        # to the pipeline package directory next to this file.
+        script_path = os.path.join(cwd, script)
+
+        if not os.path.exists(script_path):
+            alt = os.path.join(os.path.dirname(__file__), script)
+            if os.path.exists(alt):
+                script_path = alt
+            else:
+                overall_ok = False
+                fatal_error = f"Script not found for step '{step}': {script_path}"
+                logger.error(fatal_error)
+                break
+
+        # Execute the step and time its duration. Record status and stderr.
+        t0 = time.time()
+        status = "success"
+        rc = 0
+        stderr = ""
+
+        try:
+            rc, _, stderr = run_python_script(
+                script_path,
+                cwd=os.path.dirname(script_path),
+                env=child_env,
+                timeout_sec=args.timeout_sec,
+                logger=logger,
+            )
+            if rc != 0:
+                status = "failed"
+                overall_ok = False
+                fatal_error = f"Step '{step}' failed (exit_code={rc})"
+        except subprocess.TimeoutExpired:
+            status = "timeout"
+            overall_ok = False
+            fatal_error = f"Step '{step}' timed out after {args.timeout_sec}s"
+        except Exception as e:
+            status = "error"
+            overall_ok = False
+            fatal_error = f"Step '{step}' crashed: {e}"
+
+        t1 = time.time()
+        steps_log.append(
+            {
+                "step": step,
+                "script": os.path.basename(script_path),
+                "status": status,
+                "exit_code": rc,
+                "duration_sec": round(t1 - t0, 3),
+                "ran_at_utc": datetime.now(timezone.utc).isoformat(),
+                "stderr_preview": (stderr[:800] if stderr else ""),
+            }
+        )
+
+        # Persist an in-progress update of the run so monitoring shows live
+        # progress; failures here shouldn't stop the pipeline.
+        if conn is not None and run_id is not None:
+            try:
+                update_run(
+                    conn,
+                    run_id,
+                    status="running" if overall_ok else "failed",
+                    ended_at=None,
+                    steps=steps_log,
+                    error=None if overall_ok else fatal_error,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to update etl_runs mid-run: {e}")
+
+        # If a step failed fatally, stop executing further steps.
+        if not overall_ok:
+            logger.error(f"Stopping pipeline: {fatal_error}")
+            break
+
+    # Finalize the run: mark end time and final status and persist.
+    ended_at = datetime.now(timezone.utc)
+
+    if conn is not None and run_id is not None:
+        try:
+            update_run(
+                conn,
+                run_id,
+                status="success" if overall_ok else "failed",
+                ended_at=ended_at,
+                steps=steps_log,
+                error=None if overall_ok else fatal_error,
+            )
+            logger.info(f"etl_runs run_id={run_id} finished status={'success' if overall_ok else 'failed'}")
+        except Exception as e:
+            logger.warning(f"Failed to finalize etl_runs: {e}")
+
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    logger.info(f"Pipeline end ok={overall_ok} duration_sec={(ended_at - started_at).total_seconds():.1f}")
+    return 0 if overall_ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
