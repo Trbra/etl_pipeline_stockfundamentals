@@ -5,23 +5,47 @@ import { apiGet } from "@/lib/api";
 import PriceChart from "@/components/PriceChart";
 import type { SeriesPoint } from "@/lib/types";
 
-export default function CompanyPage({ params }: { params: { ticker: string } }) {
-  const ticker = params.ticker;
+type PageProps = {
+  params: Promise<{ ticker: string }>;
+};
+
+export default function CompanyPage({ params }: PageProps) {
+  const [ticker, setTicker] = useState<string>("");
   const [series, setSeries] = useState<SeriesPoint[]>([]);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
-    setErr(null);
-    apiGet<SeriesPoint[]>(`/api/company/${ticker}/series?days=365`)
-      .then(setSeries)
-      .catch((e) => setErr(String(e)));
-  }, [ticker]);
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const p = await params;
+        if (cancelled) return;
+
+        setTicker(p.ticker);
+
+        setErr(null);
+        const data = await apiGet<SeriesPoint[]>(`/api/company/${p.ticker}/series?days=365`);
+        if (!cancelled) setSeries(data);
+      } catch (e) {
+        if (!cancelled) setErr(String(e));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [params]);
 
   return (
     <div>
-      <div className="text-2xl font-semibold">{ticker}</div>
+      <div className="text-2xl font-semibold">{ticker || "..."}</div>
       <div className="mt-3">
-        {err ? <div className="text-red-300 whitespace-pre-wrap">{err}</div> : <PriceChart series={series} />}
+        {err ? (
+          <div className="text-red-300 whitespace-pre-wrap">{err}</div>
+        ) : (
+          <PriceChart series={series} />
+        )}
       </div>
     </div>
   );
