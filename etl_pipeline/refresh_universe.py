@@ -202,7 +202,7 @@ def main():
         return
 
     try:
-        with psycopg2.connect(**DB_CONFIG) as conn:
+        with psycopg2.connect(DB_CONFIG) as conn:
             with conn.cursor() as cur:
                 # Ensure universes exist
                 cur.execute(

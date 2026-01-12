@@ -19,7 +19,7 @@ KEEP_FUNDAMENTAL_YEARS = 3   # ~3 years
 
 
 def main():
-    with psycopg2.connect(**DB_CONFIG) as conn:
+    with psycopg2.connect(DB_CONFIG) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM metrics WHERE price_date < CURRENT_DATE - INTERVAL %s;",

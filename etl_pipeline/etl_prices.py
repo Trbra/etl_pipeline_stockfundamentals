@@ -129,7 +129,7 @@ def update_ticker_map(cur, ticker_raw: str, new_ticker_yf: str):
 def main():
     as_of = dt_date.today()
 
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = psycopg2.connect(DB_CONFIG)
     cur = conn.cursor()
 
     universe_rows = fetch_active_universe(cur, as_of)

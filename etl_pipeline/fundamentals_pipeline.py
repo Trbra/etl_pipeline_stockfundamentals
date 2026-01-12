@@ -139,7 +139,7 @@ def main():
     as_of = date.today()
 
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
+        conn = psycopg2.connect(DB_CONFIG)
         cur = conn.cursor()
 
         tickers = fetch_active_universe_tickers(cur, as_of)

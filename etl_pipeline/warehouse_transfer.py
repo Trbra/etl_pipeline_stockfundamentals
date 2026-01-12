@@ -6,7 +6,7 @@ load_dotenv()
 
 DB_CONFIG = os.getenv("DATABASE_URL")
 
-conn = psycopg2.connect(**DB_CONFIG)
+conn = psycopg2.connect(DB_CONFIG)
 cur = conn.cursor()
 
 try:
