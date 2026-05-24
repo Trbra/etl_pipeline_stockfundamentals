@@ -126,7 +126,7 @@ class RankingRow(BaseModel):
     market_cap: Optional[int] = None
 
     score: float
-    trend_score: float
+    trend_score: Optional[float] = None
     rsi_score: float
     value_score: float
     size_score: float

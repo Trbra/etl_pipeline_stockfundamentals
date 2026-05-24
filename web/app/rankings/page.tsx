@@ -15,7 +15,7 @@ type RankingRow = {
   market_cap?: number | null;
 
   score: number;
-  trend_score: number;
+  trend_score?: number | null;
   rsi_score: number;
   value_score: number;
   size_score: number;
@@ -23,6 +23,17 @@ type RankingRow = {
 
   reasons: Record<string, any>;
 };
+
+function formatDividendYield(value?: number | null) {
+  if (value == null) return "N/A";
+  const pct = value > 1.5 ? value : value * 100;
+  return `${pct.toFixed(2)}%`;
+}
+
+function trendLabel(score?: number | null) {
+  if (score == null) return "Pending";
+  return score > 0 ? "Bull" : "—";
+}
 
 export default function RankingsPage() {
   const [rows, setRows] = useState<RankingRow[]>([]);
@@ -61,17 +72,15 @@ export default function RankingsPage() {
                 <td className="p-3 font-semibold">{r.ticker}</td>
                 <td className="p-3 text-zinc-300">{r.name ?? ""}</td>
                 <td className="p-3 font-semibold">{r.score.toFixed(3)}</td>
-                <td className="p-3">{r.trend_score > 0 ? "Bull" : "—"}</td>
+                <td className="p-3">{trendLabel(r.trend_score)}</td>
                 <td className="p-3">{r.rsi14 != null ? r.rsi14.toFixed(1) : "N/A"}</td>
                 <td className="p-3">{r.pe_ratio != null ? r.pe_ratio.toFixed(1) : "N/A"}</td>
-                <td className="p-3">
-                  {r.dividend_yield != null ? (r.dividend_yield * 100).toFixed(2) + "%" : "N/A"}
-                </td>
+                <td className="p-3">{formatDividendYield(r.dividend_yield)}</td>
                 <td className="p-3 text-zinc-400 max-w-[420px]">
-                  {r.reasons?.trend_bullish ? "MA50>MA200; " : ""}
+                  {r.trend_score == null ? "Trend pending; " : r.reasons?.trend_bullish ? "MA50>MA200; " : ""}
                   {r.rsi14 != null ? `RSI=${r.rsi14.toFixed(1)}; ` : ""}
                   {r.pe_ratio != null ? `P/E=${r.pe_ratio.toFixed(1)}; ` : ""}
-                  {r.dividend_yield != null ? `Yield=${(r.dividend_yield * 100).toFixed(2)}%` : ""}
+                  {r.dividend_yield != null ? `Yield=${formatDividendYield(r.dividend_yield)}` : ""}
                 </td>
               </tr>
             ))}

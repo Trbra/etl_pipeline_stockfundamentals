@@ -47,6 +47,11 @@ function colorForTicker(ticker: string) {
   return PALETTE[hashString(ticker) % PALETTE.length];
 }
 
+function normalizeDividendYield(value?: number | null) {
+  if (value == null) return null;
+  return value > 1.5 ? value : value * 100;
+}
+
 export default function FundamentalsCompare({
   tickers,
   snapshots,
@@ -60,7 +65,7 @@ export default function FundamentalsCompare({
       return {
         ticker: t,
         pe_ratio: s?.pe_ratio ?? null,
-        dividend_yield_pct: s?.dividend_yield != null ? s.dividend_yield * 100 : null,
+        dividend_yield_pct: normalizeDividendYield(s?.dividend_yield),
         market_cap_b: s?.market_cap != null ? s.market_cap / 1e9 : null,
       };
     });
