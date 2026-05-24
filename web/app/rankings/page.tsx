@@ -34,7 +34,13 @@ type RankingRow = {
 
 function formatDividendYield(value?: number | null) {
   if (value == null) return "N/A";
-  const pct = Math.abs(value) > 5 ? value / 100 : value * 100;
+  const absValue = Math.abs(value);
+  let pct = value;
+  if (absValue <= 0.2) {
+    pct = value * 100;
+  } else if (absValue >= 5) {
+    pct = value / 100;
+  }
   return `${pct.toFixed(2)}%`;
 }
 
