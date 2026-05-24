@@ -134,7 +134,11 @@ class RankingRow(BaseModel):
     quality_score: Optional[float] = None
     quality_factors: Optional[Dict[str, Optional[float]]] = None
     score_raw: Optional[float] = None
+    base_score: Optional[float] = None
+    penalty_total: Optional[float] = None
+    final_score_raw: Optional[float] = None
     final_after_penalties: Optional[float] = None
+    final_score: Optional[float] = None
     penalties: Optional[Dict[str, float]] = None
     factor_percentiles: Optional[Dict[str, Optional[float]]] = None
     missing_factors: Optional[List[str]] = None
@@ -1062,15 +1066,19 @@ async def rankings(
         r.normalized_weights = effective
         r.contributions = contribs
         r.score_raw = final_raw
+        r.base_score = final_raw
         r.penalties = penalties
+        r.penalty_total = total_penalty
         r.factor_percentiles = factor_pcts
         r.final_after_penalties = _clamp(final_raw - total_penalty, 0.0, 1.0)
+        r.final_score_raw = r.final_after_penalties
 
     # Final calibration: convert final_after_penalties into percentile across universe
     final_vals = [r.final_after_penalties for r in out]
     final_pcts = _compute_percentiles(final_vals, invert=False)
     for i, r in enumerate(out):
         r.score = final_pcts[i] if final_pcts[i] is not None else 0.0
+        r.final_score = r.score
 
     # Enforce sector cap to avoid domination (unchanged behavior)
     max_per_sector = int(params.get("max_per_sector", 3))

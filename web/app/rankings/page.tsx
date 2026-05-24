@@ -31,7 +31,10 @@ type RankingRow = {
   debt_to_equity?: number | null;
   factor_percentiles?: Record<string, number | null>;
   penalties?: Record<string, number>;
+  base_score?: number | null;
+  penalty_total?: number | null;
   final_after_penalties?: number | null;
+  final_score?: number | null;
 
   reasons: Record<string, any>;
   sector_cap_applied?: boolean;
@@ -143,13 +146,22 @@ export default function RankingsPage() {
                   {r.sector_cap_applied ? (
                     <div className="mt-1 text-xs text-amber-300">Notes: Sector cap applied</div>
                   ) : null}
+                  {r.base_score != null ? (
+                    <div className="mt-1 text-xs text-zinc-400">Base score: {r.base_score.toFixed(3)}</div>
+                  ) : null}
                   {r.penalties && Object.keys(r.penalties).length ? (
                     <div className="mt-1 text-xs text-rose-300">
                       Penalties: {Object.entries(r.penalties).map(([k, v]) => `${k}=${v.toFixed(2)}`).join(", ")}
                     </div>
                   ) : null}
+                  {r.penalty_total != null ? (
+                    <div className="mt-1 text-xs text-rose-300">Penalty total: -{r.penalty_total.toFixed(3)}</div>
+                  ) : null}
                   {r.final_after_penalties != null ? (
-                    <div className="mt-1 text-xs text-zinc-400">After penalties: {r.final_after_penalties.toFixed(3)}</div>
+                    <div className="mt-1 text-xs text-zinc-400">After penalties (raw): {r.final_after_penalties.toFixed(3)}</div>
+                  ) : null}
+                  {r.final_score != null ? (
+                    <div className="mt-1 text-xs font-semibold">Final score: {r.final_score.toFixed(3)}</div>
                   ) : null}
                 </td>
               </tr>
