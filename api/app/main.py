@@ -134,6 +134,9 @@ class RankingRow(BaseModel):
     quality_score: Optional[float] = None
     quality_factors: Optional[Dict[str, Optional[float]]] = None
     score_raw: Optional[float] = None
+    final_after_penalties: Optional[float] = None
+    penalties: Optional[Dict[str, float]] = None
+    factor_percentiles: Optional[Dict[str, Optional[float]]] = None
     missing_factors: Optional[List[str]] = None
     sector_cap_applied: Optional[bool] = None
     effective_weights: Optional[Dict[str, float]] = None
@@ -331,7 +334,16 @@ async def get_ranking_config():
                 "rsi_max": 100.0,
                 "max_per_sector": 3,
                 "sector_cap_top_n": 20,
-                "compression_gamma": 1.35,
+                "compression_gamma": 1.0,
+                "penalty_rsi_high": 0.03,
+                "penalty_rsi_low": 0.03,
+                "penalty_pe_50": 0.04,
+                "penalty_pe_80": 0.12,
+                "penalty_negative_eps": 0.35,
+                "penalty_revenue_decline": 0.05,
+                "penalty_eps_decline": 0.08,
+                "penalty_high_debt": 0.06,
+                "penalty_missing_quality": 0.03,
                 "disable_yield_before_ma200": True,
             },
             active=True,
@@ -489,6 +501,32 @@ def _normalize_dividend_yield(raw: Optional[float]) -> Optional[float]:
 
 def _clamp(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
+
+
+def _compute_percentiles(values: list[Optional[float]], invert: bool = False) -> list[Optional[float]]:
+    """Compute percentiles (0..1) for a list of values. None values return None.
+    If invert=True, higher raw values become lower percentiles (useful for P/E where lower is better).
+    """
+    import bisect
+
+    clean = [v for v in values if v is not None]
+    if not clean:
+        return [None] * len(values)
+    sorted_vals = sorted(clean)
+    n = len(sorted_vals)
+    out = []
+    for v in values:
+        if v is None:
+            out.append(None)
+            continue
+        # rank as fraction of values strictly less than v
+        rank = bisect.bisect_left(sorted_vals, v)
+        pct = rank / (n - 1) if n > 1 else 1.0
+        if invert:
+            pct = 1.0 - pct
+        # clamp to [0,1]
+        out.append(_clamp(pct, 0.0, 1.0))
+    return out
 
 
 def _score_rsi(rsi: Optional[float]) -> Optional[float]:
@@ -905,6 +943,7 @@ async def rankings(
                     "net_income": _to_float(row.get("net_income")),
                     "net_income_prev": _to_float(row.get("net_income_prev")),
                     "free_cash_flow": _to_float(row.get("free_cash_flow")),
+                    "trailing_eps": _to_float(row.get("trailing_eps")),
                 },
                 reasons={
                     "trend_bullish": row.get("trend_bullish"),
@@ -913,20 +952,127 @@ async def rankings(
             )
         )
 
-    # Apply compression and min-max scaling so scores are less compressed near 1.0
-    gamma = float(params.get("compression_gamma", 1.35))
-    # compute scaled values
-    scaled = [((r.score_raw or 0.0) ** gamma) for r in out]
-    mn = min(scaled) if scaled else 0.0
-    mx = max(scaled) if scaled else 1.0
-    if mx > mn:
-        for i, r in enumerate(out):
-            r.score = (scaled[i] - mn) / (mx - mn)
-    else:
-        for i, r in enumerate(out):
-            r.score = scaled[i]
+    # Compute percentiles per factor across the candidate pool
+    trend_vals = [r.trend_score for r in out]
+    quality_vals = [r.quality_score for r in out]
+    value_vals = [r.pe_ratio for r in out]
+    rsi_vals = [r.rsi14 for r in out]
+    size_vals = [r.market_cap for r in out]
+    yield_vals = [r.dividend_yield for r in out]
 
-    # Enforce sector cap to avoid domination
+    trend_pcts = _compute_percentiles(trend_vals, invert=False)
+    quality_pcts = _compute_percentiles(quality_vals, invert=False)
+    # For value/P-E, lower is better => invert=True; ignore nonpositive P/E
+    value_clean = [v if (v is not None and v > 0) else None for v in value_vals]
+    value_pcts = _compute_percentiles(value_clean, invert=True)
+    rsi_pcts = _compute_percentiles(rsi_vals, invert=False)
+    size_pcts = _compute_percentiles(size_vals, invert=False)
+    yield_pcts = _compute_percentiles(yield_vals, invert=False)
+
+    # Penalty thresholds
+    p_rsi_high = float(params.get("penalty_rsi_high", 0.03))
+    p_rsi_low = float(params.get("penalty_rsi_low", 0.03))
+    p_pe_50 = float(params.get("penalty_pe_50", 0.04))
+    p_pe_80 = float(params.get("penalty_pe_80", 0.12))
+    p_neg_eps = float(params.get("penalty_negative_eps", 0.35))
+    p_rev_decline = float(params.get("penalty_revenue_decline", 0.05))
+    p_eps_decline = float(params.get("penalty_eps_decline", 0.08))
+    p_high_debt = float(params.get("penalty_high_debt", 0.06))
+    p_missing_quality = float(params.get("penalty_missing_quality", 0.03))
+
+    # Compute weighted percentile-based scores and penalties
+    for i, r in enumerate(out):
+        # normalized factor scores = percentiles (0..1)
+        factor_pcts = {
+            "trend": trend_pcts[i],
+            "quality": quality_pcts[i],
+            "value": value_pcts[i],
+            "rsi": rsi_pcts[i],
+            "size": size_pcts[i],
+            "yield": yield_pcts[i],
+        }
+
+        # Recompute effective weights based on available percentiles
+        avail = {k: factor_pcts.get(k) is not None for k in factor_pcts}
+        effective = _normalize_weights(cfg.weights, avail)
+
+        contribs = {}
+        for k, pct in factor_pcts.items():
+            if pct is None:
+                continue
+            contribs[k] = effective.get(k, 0.0) * pct
+
+        final_raw = sum(contribs.values())
+
+        # Penalties
+        penalties: Dict[str, float] = {}
+        # RSI penalties
+        rsi_val = r.rsi14
+        if rsi_val is not None:
+            if rsi_val > float(params.get("rsi_max", 100.0)):
+                pass
+            if rsi_val >= float(params.get("rsi_max", 100.0)):
+                pass
+            if rsi_val > float(params.get("rsi_max", 100.0)):
+                pass
+            if rsi_val > 75:
+                penalties["rsi_high"] = p_rsi_high
+            if rsi_val < 30:
+                penalties["rsi_low"] = p_rsi_low
+
+        # P/E penalties
+        pe = r.pe_ratio
+        if pe is not None:
+            if pe > 80:
+                penalties["pe_80"] = p_pe_80
+            elif pe > 50:
+                penalties["pe_50"] = p_pe_50
+        else:
+            # missing or invalid P/E -> small penalty
+            penalties["pe_missing"] = 0.01
+
+        # Negative EPS
+        if r.raw_values and r.raw_values.get("trailing_eps") is not None:
+            if r.raw_values.get("trailing_eps") < 0:
+                penalties["negative_eps"] = p_neg_eps
+
+        # Revenue / EPS decline penalties if prev exists
+        rev = r.raw_values.get("revenue") if r.raw_values else None
+        rev_prev = r.raw_values.get("revenue_prev") if r.raw_values else None
+        if rev is not None and rev_prev is not None and rev_prev != 0 and rev < rev_prev:
+            penalties["revenue_decline"] = p_rev_decline
+
+        ni = r.raw_values.get("net_income") if r.raw_values else None
+        ni_prev = r.raw_values.get("net_income_prev") if r.raw_values else None
+        if ni is not None and ni_prev is not None and ni_prev != 0 and ni < ni_prev:
+            penalties["eps_decline"] = p_eps_decline
+
+        # High debt/equity
+        dte = r.debt_to_equity
+        if dte is not None and dte > 3.0:
+            penalties["high_debt"] = p_high_debt
+
+        # Missing quality
+        if r.quality_score is None:
+            penalties["missing_quality"] = p_missing_quality
+
+        total_penalty = sum(penalties.values())
+
+        # Store intermediate values
+        r.normalized_weights = effective
+        r.contributions = contribs
+        r.score_raw = final_raw
+        r.penalties = penalties
+        r.factor_percentiles = factor_pcts
+        r.final_after_penalties = _clamp(final_raw - total_penalty, 0.0, 1.0)
+
+    # Final calibration: convert final_after_penalties into percentile across universe
+    final_vals = [r.final_after_penalties for r in out]
+    final_pcts = _compute_percentiles(final_vals, invert=False)
+    for i, r in enumerate(out):
+        r.score = final_pcts[i] if final_pcts[i] is not None else 0.0
+
+    # Enforce sector cap to avoid domination (unchanged behavior)
     max_per_sector = int(params.get("max_per_sector", 3))
     selected: List[RankingRow] = []
     excluded: List[RankingRow] = []

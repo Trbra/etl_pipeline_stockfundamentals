@@ -29,6 +29,9 @@ type RankingRow = {
   profit_margin?: number | null;
   roe?: number | null;
   debt_to_equity?: number | null;
+  factor_percentiles?: Record<string, number | null>;
+  penalties?: Record<string, number>;
+  final_after_penalties?: number | null;
 
   reasons: Record<string, any>;
   sector_cap_applied?: boolean;
@@ -92,7 +95,12 @@ export default function RankingsPage() {
                 <td className="p-3 text-zinc-300">{r.name ?? ""}</td>
                 <td className="p-3 font-semibold">{r.score != null ? r.score.toFixed(3) : "N/A"}</td>
                 <td className="p-3">{r.quality_score != null ? `${Math.round(r.quality_score * 100)}%` : "N/A"}</td>
-                <td className="p-3">{trendLabel(r.trend_score)}</td>
+                <td className="p-3">
+                  {trendLabel(r.trend_score)}
+                  {r.factor_percentiles?.trend != null ? (
+                    <span className="text-zinc-400">, {Math.round((r.factor_percentiles.trend ?? 0) * 100)}th</span>
+                  ) : null}
+                </td>
                 <td className="p-3">{r.rsi14 != null ? r.rsi14.toFixed(1) : "N/A"}</td>
                 <td className="p-3">{r.pe_ratio != null ? r.pe_ratio.toFixed(1) : "N/A"}</td>
                 <td className="p-3">{formatDividendYield(r.dividend_yield)}</td>
@@ -134,6 +142,14 @@ export default function RankingsPage() {
                   ) : null}
                   {r.sector_cap_applied ? (
                     <div className="mt-1 text-xs text-amber-300">Notes: Sector cap applied</div>
+                  ) : null}
+                  {r.penalties && Object.keys(r.penalties).length ? (
+                    <div className="mt-1 text-xs text-rose-300">
+                      Penalties: {Object.entries(r.penalties).map(([k, v]) => `${k}=${v.toFixed(2)}`).join(", ")}
+                    </div>
+                  ) : null}
+                  {r.final_after_penalties != null ? (
+                    <div className="mt-1 text-xs text-zinc-400">After penalties: {r.final_after_penalties.toFixed(3)}</div>
                   ) : null}
                 </td>
               </tr>
