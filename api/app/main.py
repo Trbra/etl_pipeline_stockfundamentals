@@ -11,11 +11,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # api/.env should define this
+DATABASE_URL = os.getenv("DATABASE_URL")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000")
 
 if not DATABASE_URL:
-    # fallback if you still want to use DB_* (not recommended long term)
     DB_NAME = os.getenv("DB_NAME")
     DB_USER = os.getenv("DB_USER")
     DB_PASSWORD = os.getenv("DB_PASSWORD")
@@ -42,7 +41,7 @@ async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
         if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL not set (api/.env missing DATABASE_URL)")
+            raise RuntimeError("DATABASE_URL not set")
         _pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=10)
     return _pool
 
@@ -66,10 +65,6 @@ async def execute(sql: str, *args):
 
 
 def _normalize_json(val: Any) -> Dict[str, Any]:
-    """
-    asyncpg usually returns json/jsonb as dict, but some environments return str.
-    Normalize to dict for pydantic.
-    """
     if val is None:
         return {}
     if isinstance(val, dict):
@@ -82,9 +77,6 @@ def _normalize_json(val: Any) -> Dict[str, Any]:
     return {"raw": str(val)}
 
 
-# -------------------------
-# Models
-# -------------------------
 class ScreenerRow(BaseModel):
     ticker: str
     name: Optional[str] = None
@@ -177,40 +169,29 @@ class StatusResponse(BaseModel):
     latest_fundamentals_date: Optional[date] = None
     notes: Optional[str] = None
 
+
 class DataQualitySnapshot(BaseModel):
     dq_date: date
     created_at: datetime
-
     universe_companies: int
     companies_in_dim: int
-
     tickers_with_price_today: int
     tickers_missing_price_today: int
     pct_with_price_today: float
-
     tickers_with_metrics_today: int
     tickers_missing_metrics_today: int
     pct_with_metrics_today: float
-
     tickers_with_ma200_today: int
     pct_with_ma200_today: float
-
     tickers_with_rsi_today: int
     pct_with_rsi_today: float
-
     duplicates_fact_prices: int
     duplicates_fact_metrics: int
-
     nonpositive_prices_today: int
     zero_volume_today: int
-
     notes: Optional[str] = None
-    
 
 
-# -------------------------
-# Debug / Health
-# -------------------------
 @app.get("/health")
 async def health():
     return {"ok": True}
@@ -235,30 +216,24 @@ async def debug_db_counts():
     return dict(rows[0])
 
 
-# -------------------------
-# Status API (NEW)
-# -------------------------
 @app.get("/api/status", response_model=StatusResponse)
 async def status():
-    """
-    Status endpoint for the GUI status page.
-    Returns pipeline freshness + row counts.
-    """
     try:
         row = await fetchrow(
             """
             SELECT
               (SELECT COUNT(*) FROM warehouse.v_screener_latest) AS screener_rows,
-              (SELECT COUNT(*) FROM warehouse.dim_company)       AS dim_company_rows,
-              (SELECT COUNT(*) FROM warehouse.fact_prices)       AS fact_prices_rows,
-              (SELECT COUNT(*) FROM warehouse.fact_metrics)      AS fact_metrics_rows,
-              (SELECT MAX(full_date) FROM warehouse.v_price_series)   AS latest_price_date,
+              (SELECT COUNT(*) FROM warehouse.dim_company) AS dim_company_rows,
+              (SELECT COUNT(*) FROM warehouse.fact_prices) AS fact_prices_rows,
+              (SELECT COUNT(*) FROM warehouse.fact_metrics) AS fact_metrics_rows,
+              (SELECT MAX(full_date) FROM warehouse.v_price_series) AS latest_price_date,
               (SELECT MAX(full_date) FROM warehouse.v_metrics_series) AS latest_metrics_date,
               (SELECT MAX(d.full_date)
                FROM warehouse.fact_fundamentals ff
-               JOIN warehouse.dim_date d ON d.date_id = ff.date_id)   AS latest_fundamentals_date;
+               JOIN warehouse.dim_date d ON d.date_id = ff.date_id) AS latest_fundamentals_date;
             """
         )
+
         if not row:
             return StatusResponse(
                 ok=False,
@@ -271,7 +246,7 @@ async def status():
                 latest_price_date=None,
                 latest_metrics_date=None,
                 latest_fundamentals_date=None,
-                notes="Status query returned no rows (unexpected)",
+                notes="Status query returned no rows",
             )
 
         r = dict(row)
@@ -289,7 +264,6 @@ async def status():
             notes=None,
         )
     except Exception as e:
-        # Keep response JSON so UI can still render a failure state
         return StatusResponse(
             ok=False,
             db_connected=False,
@@ -305,9 +279,6 @@ async def status():
         )
 
 
-# -------------------------
-# Ranking Config API
-# -------------------------
 @app.get("/api/ranking-config", response_model=RankingConfig)
 async def get_ranking_config():
     row = await fetchrow(
@@ -319,6 +290,7 @@ async def get_ranking_config():
         LIMIT 1;
         """
     )
+
     if not row:
         return RankingConfig(
             name="default",
@@ -361,7 +333,6 @@ async def get_ranking_config():
 
 @app.put("/api/ranking-config", response_model=RankingConfig)
 async def update_ranking_config(cfg: RankingConfig):
-    # Validate: weights sum to ~1
     if not cfg.weights:
         raise HTTPException(status_code=400, detail="weights cannot be empty")
 
@@ -369,13 +340,11 @@ async def update_ranking_config(cfg: RankingConfig):
     if s <= 0.99 or s >= 1.01:
         raise HTTPException(status_code=400, detail=f"Weights must sum to 1.0 (got {s})")
 
-    # Ensure the keys exist (optional but nice)
     required = {"trend", "rsi", "value", "size", "yield"}
     missing = required - set(cfg.weights.keys())
     if missing:
         raise HTTPException(status_code=400, detail=f"Missing weight keys: {sorted(list(missing))}")
 
-    # Update active config row
     await execute(
         """
         UPDATE warehouse.ranking_config
@@ -391,10 +360,6 @@ async def update_ranking_config(cfg: RankingConfig):
     return cfg
 
 
-# -------------------------
-# Screener API
-# -------------------------
-
 @app.get("/")
 async def root():
     return {
@@ -403,6 +368,7 @@ async def root():
         "docs": "/docs",
         "health": "/health",
     }
+
 
 @app.get("/api/screener", response_model=List[ScreenerRow])
 async def screener(
@@ -420,14 +386,17 @@ async def screener(
         where.append(f"(ticker ILIKE ${i} OR name ILIKE ${i})")
         args.append(f"%{q}%")
         i += 1
+
     if sector:
         where.append(f"sector = ${i}")
         args.append(sector)
         i += 1
+
     if rsi_lte is not None:
         where.append(f"rsi14 <= ${i}")
         args.append(rsi_lte)
         i += 1
+
     if bullish is not None:
         where.append(f"trend_bullish = ${i}")
         args.append(bullish)
@@ -454,20 +423,20 @@ async def screener(
 async def company_series(ticker: str, days: int = Query(365, ge=7, le=5000)):
     rows = await fetch(
         """
-      SELECT
-        ps.full_date AS date,
-        ps.close_price AS close,
-        ps.volume,
-        ms.ma50,
-        ms.ma200,
-        ms.rsi14
-      FROM warehouse.v_price_series ps
-      LEFT JOIN warehouse.v_metrics_series ms
-        ON ms.ticker = ps.ticker AND ms.full_date = ps.full_date
-      WHERE ps.ticker = $1
-      ORDER BY ps.full_date DESC
-      LIMIT $2;
-    """,
+        SELECT
+          ps.full_date AS date,
+          ps.close_price AS close,
+          ps.volume,
+          ms.ma50,
+          ms.ma200,
+          ms.rsi14
+        FROM warehouse.v_price_series ps
+        LEFT JOIN warehouse.v_metrics_series ms
+          ON ms.ticker = ps.ticker AND ms.full_date = ps.full_date
+        WHERE ps.ticker = $1
+        ORDER BY ps.full_date DESC
+        LIMIT $2;
+        """,
         ticker,
         days,
     )
@@ -475,13 +444,9 @@ async def company_series(ticker: str, days: int = Query(365, ge=7, le=5000)):
     if not rows:
         raise HTTPException(status_code=404, detail="Ticker not found or no data")
 
-    rows = list(reversed(rows))  # ascending for chart
+    rows = list(reversed(rows))
     return [SeriesPoint(**dict(r)) for r in rows]
 
-
-# -------------------------
-# Rankings API (uses config weights)
-# -------------------------
 
 def _to_float(value: Any) -> Optional[float]:
     if value is None:
@@ -508,28 +473,29 @@ def _clamp(value: float, minimum: float, maximum: float) -> float:
 
 
 def _compute_percentiles(values: list[Optional[float]], invert: bool = False) -> list[Optional[float]]:
-    """Compute percentiles (0..1) for a list of values. None values return None.
-    If invert=True, higher raw values become lower percentiles (useful for P/E where lower is better).
-    """
     import bisect
 
     clean = [v for v in values if v is not None]
     if not clean:
         return [None] * len(values)
+
     sorted_vals = sorted(clean)
     n = len(sorted_vals)
     out = []
+
     for v in values:
         if v is None:
             out.append(None)
             continue
-        # rank as fraction of values strictly less than v
+
         rank = bisect.bisect_left(sorted_vals, v)
         pct = rank / (n - 1) if n > 1 else 1.0
+
         if invert:
             pct = 1.0 - pct
-        # clamp to [0,1]
+
         out.append(_clamp(pct, 0.0, 1.0))
+
     return out
 
 
@@ -550,15 +516,22 @@ def _score_rsi(rsi: Optional[float]) -> Optional[float]:
     return 0.1
 
 
-def _score_value(pe_ratio: Optional[float], trailing_eps: Optional[float], exclude_negative_eps: bool) -> Optional[float]:
+def _score_value(
+    pe_ratio: Optional[float],
+    trailing_eps: Optional[float],
+    exclude_negative_eps: bool,
+) -> Optional[float]:
     pe = _to_float(pe_ratio)
     eps = _to_float(trailing_eps)
+
     if pe is None:
         return None
+
     if eps is not None and eps < 0:
         if exclude_negative_eps:
             return None
         return 0.0
+
     if pe <= 15.0:
         return 1.0
     if pe <= 25.0:
@@ -632,10 +605,13 @@ def _score_trend(
         return None, None
 
     score = 0.5
+
     if ma50_val is not None:
         score += 0.2 if close > ma50_val else -0.2
+
     if p20_val is not None and p20_val > 0:
         score += _clamp(((close / p20_val - 1.0) / 0.1) * 0.2, -0.2, 0.2)
+
     if p60_val is not None and p60_val > 0:
         score += _clamp(((close / p60_val - 1.0) / 0.25) * 0.1, -0.1, 0.1)
 
@@ -645,17 +621,21 @@ def _score_trend(
 def _normalize_weights(weights: Dict[str, float], available: Dict[str, bool]) -> Dict[str, float]:
     active = {k: float(weights.get(k, 0.0)) for k, ok in available.items() if ok}
     total = sum(active.values())
+
     if total <= 0.0:
         count = len(active)
         return {k: 1.0 / count for k in active} if count else {}
+
     return {k: v / total for k, v in active.items()}
 
 
 def _compute_profit_margin(revenue: Optional[float], net_income: Optional[float]) -> Optional[float]:
     r = _to_float(revenue)
     n = _to_float(net_income)
+
     if r is None or n is None or r == 0:
         return None
+
     return n / r
 
 
@@ -668,18 +648,15 @@ def _score_quality(
     debt_to_equity: Optional[float],
     roe: Optional[float],
 ) -> tuple[Optional[float], Dict[str, Optional[float]]]:
-    """
-    Compute a composite quality score from fundamentals. Returns (score, detail_factors).
-    Each factor normalized to 0-1 where higher is better (for debt_to_equity lower is better).
-    """
-    # Helpers
+
     def norm_growth(curr: Optional[float], prev: Optional[float]) -> Optional[float]:
         c = _to_float(curr)
         p = _to_float(prev)
+
         if c is None or p is None or p == 0:
             return None
+
         g = (c - p) / abs(p)
-        # normalize growth -50%..+50% -> 0..1
         return _clamp((g + 0.5) / 1.0, 0.0, 1.0)
 
     def norm_positive(val: Optional[float]) -> Optional[float]:
@@ -696,31 +673,29 @@ def _score_quality(
     pm = _compute_profit_margin(revenue, net_income)
     if pm is None:
         factors["profit_margin"] = None
+    elif pm >= 0.2:
+        factors["profit_margin"] = 1.0
+    elif pm >= 0.1:
+        factors["profit_margin"] = 0.8
+    elif pm >= 0.05:
+        factors["profit_margin"] = 0.6
+    elif pm > 0:
+        factors["profit_margin"] = 0.4
     else:
-        if pm >= 0.2:
-            factors["profit_margin"] = 1.0
-        elif pm >= 0.1:
-            factors["profit_margin"] = 0.8
-        elif pm >= 0.05:
-            factors["profit_margin"] = 0.6
-        elif pm > 0:
-            factors["profit_margin"] = 0.4
-        else:
-            factors["profit_margin"] = 0.0
+        factors["profit_margin"] = 0.0
 
     if roe is None:
         factors["roe"] = None
+    elif roe >= 0.25:
+        factors["roe"] = 1.0
+    elif roe >= 0.15:
+        factors["roe"] = 0.8
+    elif roe >= 0.08:
+        factors["roe"] = 0.6
+    elif roe >= 0:
+        factors["roe"] = 0.4
     else:
-        if roe >= 0.25:
-            factors["roe"] = 1.0
-        elif roe >= 0.15:
-            factors["roe"] = 0.8
-        elif roe >= 0.08:
-            factors["roe"] = 0.6
-        elif roe >= 0:
-            factors["roe"] = 0.4
-        else:
-            factors["roe"] = 0.0
+        factors["roe"] = 0.0
 
     if debt_to_equity is None:
         factors["debt_to_equity"] = None
@@ -739,10 +714,10 @@ def _score_quality(
 
     factors["free_cash_flow_positive"] = norm_positive(free_cash_flow)
 
-    # Average available factors
     vals = [v for v in factors.values() if v is not None]
     if not vals:
         return None, factors
+
     score = sum(vals) / len(vals)
     return _clamp(score, 0.0, 1.0), factors
 
@@ -768,6 +743,7 @@ async def rankings(
         "s.rsi14 IS NOT NULL",
         "s.pe_ratio IS NOT NULL",
     ]
+
     args: List[Any] = [min_market_cap]
     i = 2
 
@@ -778,22 +754,25 @@ async def rankings(
 
     if exclude_negative_eps:
         where.append("(s.trailing_eps IS NULL OR s.trailing_eps >= 0)")
+
     if rsi_min > 0.0:
         where.append(f"s.rsi14 >= ${i}")
         args.append(rsi_min)
         i += 1
+
     if rsi_max < 100.0:
         where.append(f"s.rsi14 <= ${i}")
         args.append(rsi_max)
         i += 1
+
     if sector:
         where.append(f"s.sector = ${i}")
         args.append(sector)
         i += 1
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-
     query_limit = max(limit * 20, 200)
+
     rows = await fetch(
         f"""
         SELECT
@@ -845,27 +824,29 @@ async def rankings(
           ORDER BY d2.full_date DESC
           LIMIT 1
         ) f ON TRUE
-                LEFT JOIN LATERAL (
-                    SELECT ff2.revenue, ff2.net_income
-                    FROM warehouse.fact_financials ff2
-                    JOIN warehouse.dim_company c3 ON c3.company_id = ff2.company_id
-                    JOIN warehouse.dim_date d3 ON d3.date_id = ff2.date_id
-                    WHERE c3.ticker = s.ticker
-                    ORDER BY d3.full_date DESC
-                    OFFSET 1 LIMIT 1
-                ) fprev ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT ff2.revenue, ff2.net_income
+          FROM warehouse.fact_financials ff2
+          JOIN warehouse.dim_company c3 ON c3.company_id = ff2.company_id
+          JOIN warehouse.dim_date d3 ON d3.date_id = ff2.date_id
+          WHERE c3.ticker = s.ticker
+          ORDER BY d3.full_date DESC
+          OFFSET 1 LIMIT 1
+        ) fprev ON TRUE
         {where_sql}
-                ORDER BY s.market_cap DESC NULLS LAST
-                LIMIT {query_limit};
+        ORDER BY s.market_cap DESC NULLS LAST
+        LIMIT {query_limit};
         """,
         *args,
     )
 
     out: List[RankingRow] = []
+
     for r in rows:
         row = dict(r)
 
         dividend_yield_pct = _normalize_dividend_yield(row.get("dividend_yield"))
+
         trend_score, trend_source = _score_trend(
             row.get("close_price"),
             row.get("ma50"),
@@ -878,7 +859,6 @@ async def rankings(
         if disable_yield_before_ma200 and row.get("ma200") is None:
             yield_score = None
 
-        # compute quality/fundamentals score
         quality_score, quality_factors = _score_quality(
             row.get("revenue"),
             row.get("revenue_prev"),
@@ -903,13 +883,14 @@ async def rankings(
             available["yield"] = False
 
         normalized_weights = _normalize_weights(cfg.weights, available)
+
         contributions = {
             k: normalized_weights.get(k, 0.0) * scores[k]
             for k in scores
             if scores[k] is not None and k in normalized_weights
         }
-        final_score_raw = sum(contributions.values())
 
+        final_score_raw = sum(contributions.values())
         missing = [k for k, v in scores.items() if v is None]
 
         out.append(
@@ -956,7 +937,6 @@ async def rankings(
             )
         )
 
-    # Compute percentiles per factor across the candidate pool
     trend_vals = [r.trend_score for r in out]
     quality_vals = [r.quality_score for r in out]
     value_vals = [r.pe_ratio for r in out]
@@ -966,14 +946,12 @@ async def rankings(
 
     trend_pcts = _compute_percentiles(trend_vals, invert=False)
     quality_pcts = _compute_percentiles(quality_vals, invert=False)
-    # For value/P-E, lower is better => invert=True; ignore nonpositive P/E
     value_clean = [v if (v is not None and v > 0) else None for v in value_vals]
     value_pcts = _compute_percentiles(value_clean, invert=True)
     rsi_pcts = _compute_percentiles(rsi_vals, invert=False)
     size_pcts = _compute_percentiles(size_vals, invert=False)
     yield_pcts = _compute_percentiles(yield_vals, invert=False)
 
-    # Penalty thresholds
     p_rsi_high = float(params.get("penalty_rsi_high", 0.03))
     p_rsi_low = float(params.get("penalty_rsi_low", 0.03))
     p_pe_50 = float(params.get("penalty_pe_50", 0.04))
@@ -984,9 +962,7 @@ async def rankings(
     p_high_debt = float(params.get("penalty_high_debt", 0.06))
     p_missing_quality = float(params.get("penalty_missing_quality", 0.03))
 
-    # Compute weighted percentile-based scores and penalties
     for i, r in enumerate(out):
-        # normalized factor scores = percentiles (0..1)
         factor_pcts = {
             "trend": trend_pcts[i],
             "quality": quality_pcts[i],
@@ -996,7 +972,6 @@ async def rankings(
             "yield": yield_pcts[i],
         }
 
-        # Recompute effective weights based on available percentiles
         avail = {k: factor_pcts.get(k) is not None for k in factor_pcts}
         effective = _normalize_weights(cfg.weights, avail)
 
@@ -1008,23 +983,15 @@ async def rankings(
 
         final_raw = sum(contribs.values())
 
-        # Penalties
         penalties: Dict[str, float] = {}
-        # RSI penalties
+
         rsi_val = r.rsi14
         if rsi_val is not None:
-            if rsi_val > float(params.get("rsi_max", 100.0)):
-                pass
-            if rsi_val >= float(params.get("rsi_max", 100.0)):
-                pass
-            if rsi_val > float(params.get("rsi_max", 100.0)):
-                pass
             if rsi_val > 75:
                 penalties["rsi_high"] = p_rsi_high
             if rsi_val < 30:
                 penalties["rsi_low"] = p_rsi_low
 
-        # P/E penalties
         pe = r.pe_ratio
         if pe is not None:
             if pe > 80:
@@ -1032,15 +999,12 @@ async def rankings(
             elif pe > 50:
                 penalties["pe_50"] = p_pe_50
         else:
-            # missing or invalid P/E -> small penalty
             penalties["pe_missing"] = 0.01
 
-        # Negative EPS
         if r.raw_values and r.raw_values.get("trailing_eps") is not None:
             if r.raw_values.get("trailing_eps") < 0:
                 penalties["negative_eps"] = p_neg_eps
 
-        # Revenue / EPS decline penalties if prev exists
         rev = r.raw_values.get("revenue") if r.raw_values else None
         rev_prev = r.raw_values.get("revenue_prev") if r.raw_values else None
         if rev is not None and rev_prev is not None and rev_prev != 0 and rev < rev_prev:
@@ -1051,18 +1015,15 @@ async def rankings(
         if ni is not None and ni_prev is not None and ni_prev != 0 and ni < ni_prev:
             penalties["eps_decline"] = p_eps_decline
 
-        # High debt/equity
         dte = r.debt_to_equity
         if dte is not None and dte > 3.0:
             penalties["high_debt"] = p_high_debt
 
-        # Missing quality
         if r.quality_score is None:
             penalties["missing_quality"] = p_missing_quality
 
         total_penalty = sum(penalties.values())
 
-        # Store intermediate values
         r.normalized_weights = effective
         r.contributions = contribs
         r.score_raw = final_raw
@@ -1073,22 +1034,32 @@ async def rankings(
         r.final_after_penalties = _clamp(final_raw - total_penalty, 0.0, 1.0)
         r.final_score_raw = r.final_after_penalties
 
-    # Final calibration: convert final_after_penalties into percentile across universe
     final_vals = [r.final_after_penalties for r in out]
     final_pcts = _compute_percentiles(final_vals, invert=False)
-    for i, r in enumerate(out):
-        r.score = final_pcts[i] if final_pcts[i] is not None else 0.0
-        r.final_score = r.score
 
-    # Enforce sector cap to avoid domination (unchanged behavior)
+    for i, r in enumerate(out):
+        adjusted_score = r.final_after_penalties or 0.0
+
+        r.score = adjusted_score
+        r.final_score = adjusted_score
+
+        if r.factor_percentiles is None:
+            r.factor_percentiles = {}
+
+        r.factor_percentiles["final_percentile"] = final_pcts[i]
+
     max_per_sector = int(params.get("max_per_sector", 3))
+
     selected: List[RankingRow] = []
     excluded: List[RankingRow] = []
     counts: Dict[str, int] = {}
+
     sorted_rows = sorted(out, key=lambda rr: rr.score or 0.0, reverse=True)
+
     for r in sorted_rows:
         key = r.sector or "UNKNOWN"
         cnt = counts.get(key, 0)
+
         if cnt < max_per_sector:
             selected.append(r)
             counts[key] = cnt + 1
@@ -1097,20 +1068,16 @@ async def rankings(
             excluded.append(r)
             r.sector_cap_applied = True
 
-    # Fill to requested limit using excluded if needed
     final_rows: List[RankingRow] = selected[:limit]
+
     if len(final_rows) < limit:
         need = limit - len(final_rows)
         final_rows.extend(excluded[:need])
 
     return final_rows
 
-# -------------------------
-# Data Quality Snapshot API
-# -------------------------
 
 async def _upsert_dq_snapshot(d: Dict[str, Any]) -> None:
-    # Upsert daily snapshot
     await execute(
         """
         INSERT INTO warehouse.data_quality_daily (
@@ -1176,9 +1143,6 @@ async def _upsert_dq_snapshot(d: Dict[str, Any]) -> None:
 
 @app.post("/api/dq/run", response_model=DataQualitySnapshot)
 async def dq_run():
-    """
-    Computes today's data quality snapshot and stores it in warehouse.data_quality_daily.
-    """
     today = date.today()
 
     row = await fetchrow(
@@ -1250,21 +1214,14 @@ async def dq_run():
         SELECT
           (SELECT universe_companies FROM base) AS universe_companies,
           (SELECT COUNT(*)::int FROM warehouse.dim_company) AS companies_in_dim,
-
           (SELECT tickers_with_price_today FROM price_cov) AS tickers_with_price_today,
-          ((SELECT universe_companies FROM base) - (SELECT tickers_with_price_today FROM price_cov))::int
-            AS tickers_missing_price_today,
-
+          ((SELECT universe_companies FROM base) - (SELECT tickers_with_price_today FROM price_cov))::int AS tickers_missing_price_today,
           (SELECT tickers_with_metrics_today FROM metrics_cov) AS tickers_with_metrics_today,
-          ((SELECT universe_companies FROM base) - (SELECT tickers_with_metrics_today FROM metrics_cov))::int
-            AS tickers_missing_metrics_today,
-
+          ((SELECT universe_companies FROM base) - (SELECT tickers_with_metrics_today FROM metrics_cov))::int AS tickers_missing_metrics_today,
           (SELECT tickers_with_ma200_today FROM ma_cov) AS tickers_with_ma200_today,
           (SELECT tickers_with_rsi_today FROM rsi_cov) AS tickers_with_rsi_today,
-
           (SELECT duplicates_fact_prices FROM dups_prices) AS duplicates_fact_prices,
           (SELECT duplicates_fact_metrics FROM dups_metrics) AS duplicates_fact_metrics,
-
           (SELECT nonpositive_prices_today FROM sanity) AS nonpositive_prices_today,
           (SELECT zero_volume_today FROM sanity) AS zero_volume_today;
         """
@@ -1319,6 +1276,7 @@ async def dq_run():
     )
 
     d = dict(snap)
+
     return DataQualitySnapshot(
         dq_date=d["dq_date"],
         created_at=d["created_at"],
@@ -1355,6 +1313,7 @@ async def dq_latest(limit: int = Query(30, ge=1, le=365)):
     )
 
     out: List[DataQualitySnapshot] = []
+
     for r in rows:
         d = dict(r)
         out.append(
@@ -1380,4 +1339,5 @@ async def dq_latest(limit: int = Query(30, ge=1, le=365)):
                 notes=d.get("notes"),
             )
         )
+
     return out
