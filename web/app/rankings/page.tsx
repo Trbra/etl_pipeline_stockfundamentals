@@ -16,23 +16,33 @@ type RankingRow = {
 
   score: number;
   trend_score?: number | null;
-  rsi_score: number;
-  value_score: number;
-  size_score: number;
-  yield_score: number;
+  rsi_score?: number | null;
+  value_score?: number | null;
+  size_score?: number | null;
+  yield_score?: number | null;
+
+  normalized_weights?: Record<string, number>;
+  contributions?: Record<string, number>;
+  trend_source?: string | null;
+  avg_volume_60d?: number | null;
+  profit_margin?: number | null;
+  roe?: number | null;
+  debt_to_equity?: number | null;
 
   reasons: Record<string, any>;
 };
 
 function formatDividendYield(value?: number | null) {
   if (value == null) return "N/A";
-  const pct = value > 1.5 ? value : value * 100;
+  const pct = Math.abs(value) > 5 ? value / 100 : value * 100;
   return `${pct.toFixed(2)}%`;
 }
 
 function trendLabel(score?: number | null) {
   if (score == null) return "Pending";
-  return score > 0 ? "Bull" : "—";
+  if (score >= 0.75) return "Strong";
+  if (score >= 0.45) return "Neutral";
+  return "Weak";
 }
 
 export default function RankingsPage() {
@@ -77,10 +87,35 @@ export default function RankingsPage() {
                 <td className="p-3">{r.pe_ratio != null ? r.pe_ratio.toFixed(1) : "N/A"}</td>
                 <td className="p-3">{formatDividendYield(r.dividend_yield)}</td>
                 <td className="p-3 text-zinc-400 max-w-[420px]">
-                  {r.trend_score == null ? "Trend pending; " : r.reasons?.trend_bullish ? "MA50>MA200; " : ""}
-                  {r.rsi14 != null ? `RSI=${r.rsi14.toFixed(1)}; ` : ""}
-                  {r.pe_ratio != null ? `P/E=${r.pe_ratio.toFixed(1)}; ` : ""}
-                  {r.dividend_yield != null ? `Yield=${formatDividendYield(r.dividend_yield)}` : ""}
+                  {r.trend_source ? (
+                    <div className="text-xs text-zinc-500">
+                      Trend type: {r.trend_source === "long-term" ? "MA50/MA200" : "Short-term"}
+                    </div>
+                  ) : null}
+                  <div>
+                    {r.trend_score == null ? "Trend pending; " : r.reasons?.trend_bullish ? "MA50>MA200; " : ""}
+                    {r.rsi14 != null ? `RSI=${r.rsi14.toFixed(1)}; ` : ""}
+                    {r.pe_ratio != null ? `P/E=${r.pe_ratio.toFixed(1)}; ` : ""}
+                    {r.dividend_yield != null ? `Yield=${formatDividendYield(r.dividend_yield)}; ` : ""}
+                  </div>
+                  {r.normalized_weights ? (
+                    <div className="mt-1 text-xs text-zinc-500">
+                      W: T{(r.normalized_weights.trend ?? 0).toFixed(2)}
+                      &nbsp;R{(r.normalized_weights.rsi ?? 0).toFixed(2)}
+                      &nbsp;V{(r.normalized_weights.value ?? 0).toFixed(2)}
+                      &nbsp;S{(r.normalized_weights.size ?? 0).toFixed(2)}
+                      &nbsp;Y{(r.normalized_weights.yield ?? 0).toFixed(2)}
+                    </div>
+                  ) : null}
+                  {r.contributions ? (
+                    <div className="text-xs text-zinc-500">
+                      C: T{(r.contributions.trend ?? 0).toFixed(2)}
+                      &nbsp;R{(r.contributions.rsi ?? 0).toFixed(2)}
+                      &nbsp;V{(r.contributions.value ?? 0).toFixed(2)}
+                      &nbsp;S{(r.contributions.size ?? 0).toFixed(2)}
+                      &nbsp;Y{(r.contributions.yield ?? 0).toFixed(2)}
+                    </div>
+                  ) : null}
                 </td>
               </tr>
             ))}

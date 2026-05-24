@@ -127,10 +127,18 @@ class RankingRow(BaseModel):
 
     score: float
     trend_score: Optional[float] = None
-    rsi_score: float
-    value_score: float
-    size_score: float
-    yield_score: float
+    rsi_score: Optional[float] = None
+    value_score: Optional[float] = None
+    size_score: Optional[float] = None
+    yield_score: Optional[float] = None
+
+    normalized_weights: Optional[Dict[str, float]] = None
+    contributions: Optional[Dict[str, float]] = None
+    trend_source: Optional[str] = None
+    avg_volume_60d: Optional[float] = None
+    profit_margin: Optional[float] = None
+    roe: Optional[float] = None
+    debt_to_equity: Optional[float] = None
 
     reasons: Dict[str, Any] = Field(default_factory=dict)
 
@@ -298,7 +306,25 @@ async def get_ranking_config():
         """
     )
     if not row:
-        raise HTTPException(status_code=404, detail="No active ranking config found")
+        return RankingConfig(
+            name="default",
+            weights={
+                "trend": 0.4,
+                "rsi": 0.25,
+                "value": 0.25,
+                "size": 0.1,
+                "yield": 0.0,
+            },
+            params={
+                "min_market_cap": 2000000000,
+                "min_avg_volume": 250000,
+                "exclude_negative_eps": False,
+                "rsi_min": 0.0,
+                "rsi_max": 100.0,
+                "disable_yield_before_ma200": True,
+            },
+            active=True,
+        )
 
     d = dict(row)
     d["weights"] = _normalize_json(d.get("weights"))
@@ -429,60 +455,330 @@ async def company_series(ticker: str, days: int = Query(365, ge=7, le=5000)):
 # -------------------------
 # Rankings API (uses config weights)
 # -------------------------
+
+def _to_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (float, int)):
+        return float(value)
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _normalize_dividend_yield(raw: Optional[float]) -> Optional[float]:
+    if raw is None:
+        return None
+    value = _to_float(raw)
+    if value is None:
+        return None
+    return (value / 100.0) if abs(value) > 5 else value * 100.0
+
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def _score_rsi(rsi: Optional[float]) -> Optional[float]:
+    r = _to_float(rsi)
+    if r is None or r < 0:
+        return None
+    if r <= 30:
+        return 0.3 + 0.7 * (r / 30.0)
+    if r <= 40:
+        return 0.8 + 0.2 * ((r - 30.0) / 10.0)
+    if r <= 60:
+        return 1.0
+    if r <= 70:
+        return 1.0 - 0.4 * ((r - 60.0) / 10.0)
+    if r <= 80:
+        return 0.6 - 0.4 * ((r - 70.0) / 10.0)
+    return 0.1
+
+
+def _score_value(pe_ratio: Optional[float], trailing_eps: Optional[float], exclude_negative_eps: bool) -> Optional[float]:
+    pe = _to_float(pe_ratio)
+    eps = _to_float(trailing_eps)
+    if pe is None:
+        return None
+    if eps is not None and eps < 0:
+        if exclude_negative_eps:
+            return None
+        return 0.0
+    if pe <= 15.0:
+        return 1.0
+    if pe <= 25.0:
+        return 0.8 - 0.02 * (pe - 15.0)
+    if pe <= 40.0:
+        return 0.6 - 0.013333333333333334 * (pe - 25.0)
+    if pe <= 60.0:
+        return 0.4 - 0.01 * (pe - 40.0)
+    if pe <= 100.0:
+        return 0.2 - 0.005 * (pe - 60.0)
+    return 0.0
+
+
+def _score_size(market_cap: Optional[float]) -> Optional[float]:
+    m = _to_float(market_cap)
+    if m is None:
+        return None
+    if m >= 100_000_000_000.0:
+        return 1.0
+    if m >= 50_000_000_000.0:
+        return 0.9
+    if m >= 20_000_000_000.0:
+        return 0.8
+    if m >= 10_000_000_000.0:
+        return 0.65
+    if m >= 5_000_000_000.0:
+        return 0.45
+    if m >= 2_000_000_000.0:
+        return 0.25
+    return 0.0
+
+
+def _score_yield(dividend_pct: Optional[float]) -> Optional[float]:
+    if dividend_pct is None:
+        return None
+    if dividend_pct >= 6.0:
+        return 1.0
+    if dividend_pct >= 4.0:
+        return 0.8
+    if dividend_pct >= 2.0:
+        return 0.6
+    if dividend_pct > 0:
+        return 0.3
+    return 0.0
+
+
+def _score_trend(
+    close_price: Optional[float],
+    ma50: Optional[float],
+    ma200: Optional[float],
+    p20: Optional[float],
+    p60: Optional[float],
+) -> tuple[Optional[float], Optional[str]]:
+    close = _to_float(close_price)
+    if close is None:
+        return None, None
+
+    ma50_val = _to_float(ma50)
+    ma200_val = _to_float(ma200)
+    p20_val = _to_float(p20)
+    p60_val = _to_float(p60)
+
+    if ma200_val is not None and ma50_val is not None:
+        if ma50_val > ma200_val:
+            return 1.0, "long-term"
+        if close > ma50_val:
+            return 0.5, "long-term"
+        return 0.1, "long-term"
+
+    if ma50_val is None and p20_val is None and p60_val is None:
+        return None, None
+
+    score = 0.5
+    if ma50_val is not None:
+        score += 0.2 if close > ma50_val else -0.2
+    if p20_val is not None and p20_val > 0:
+        score += _clamp(((close / p20_val - 1.0) / 0.1) * 0.2, -0.2, 0.2)
+    if p60_val is not None and p60_val > 0:
+        score += _clamp(((close / p60_val - 1.0) / 0.25) * 0.1, -0.1, 0.1)
+
+    return _clamp(score, 0.0, 1.0), "short-term"
+
+
+def _normalize_weights(weights: Dict[str, float], available: Dict[str, bool]) -> Dict[str, float]:
+    active = {k: float(weights.get(k, 0.0)) for k, ok in available.items() if ok}
+    total = sum(active.values())
+    if total <= 0.0:
+        count = len(active)
+        return {k: 1.0 / count for k in active} if count else {}
+    return {k: v / total for k, v in active.items()}
+
+
+def _compute_profit_margin(revenue: Optional[float], net_income: Optional[float]) -> Optional[float]:
+    r = _to_float(revenue)
+    n = _to_float(net_income)
+    if r is None or n is None or r == 0:
+        return None
+    return n / r
+
+
 @app.get("/api/rankings", response_model=List[RankingRow])
 async def rankings(
     sector: Optional[str] = None,
     limit: int = Query(50, ge=1, le=500),
 ):
     cfg = await get_ranking_config()
+    params = cfg.params or {}
 
-    w_trend = float(cfg.weights.get("trend", 0.35))
-    w_rsi = float(cfg.weights.get("rsi", 0.25))
-    w_value = float(cfg.weights.get("value", 0.20))
-    w_size = float(cfg.weights.get("size", 0.10))
-    w_yield = float(cfg.weights.get("yield", 0.10))
+    min_market_cap = int(params.get("min_market_cap", 2000000000))
+    min_avg_volume = int(params.get("min_avg_volume", 250000))
+    exclude_negative_eps = bool(params.get("exclude_negative_eps", False))
+    rsi_min = float(params.get("rsi_min", 0.0))
+    rsi_max = float(params.get("rsi_max", 100.0))
+    disable_yield_before_ma200 = bool(params.get("disable_yield_before_ma200", True))
 
-    where = []
-    args: List[Any] = [w_trend, w_rsi, w_value, w_size, w_yield]
-    i = 6  # because $1-$5 are weights
+    where = [
+        "s.market_cap >= $1",
+        "s.close_price IS NOT NULL",
+        "s.rsi14 IS NOT NULL",
+        "s.pe_ratio IS NOT NULL",
+    ]
+    args: List[Any] = [min_market_cap]
+    i = 2
 
+    if min_avg_volume > 0:
+        where.append(f"p.avg_volume_60d >= ${i}")
+        args.append(min_avg_volume)
+        i += 1
+
+    if exclude_negative_eps:
+        where.append("(s.trailing_eps IS NULL OR s.trailing_eps >= 0)")
+    if rsi_min > 0.0:
+        where.append(f"s.rsi14 >= ${i}")
+        args.append(rsi_min)
+        i += 1
+    if rsi_max < 100.0:
+        where.append(f"s.rsi14 <= ${i}")
+        args.append(rsi_max)
+        i += 1
     if sector:
-        where.append(f"sector = ${i}")
+        where.append(f"s.sector = ${i}")
         args.append(sector)
         i += 1
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
+    query_limit = max(limit * 20, 200)
     rows = await fetch(
         f"""
         SELECT
-          ticker, name, sector, industry, price_date, close_price, rsi14, pe_ratio,
-          dividend_yield, market_cap,
-
-          ROUND((
-            $1*trend_score
-            + $2*rsi_score
-            + $3*value_score
-            + $4*size_score
-            + $5*yield_score
-          )::numeric, 4) AS score,
-
-          trend_score, rsi_score, value_score, size_score, yield_score,
-          reasons
-        FROM warehouse.v_rankings_latest
+          s.ticker,
+          s.name,
+          s.sector,
+          s.industry,
+          s.price_date,
+          s.close_price,
+          s.rsi14,
+          s.pe_ratio,
+          s.dividend_yield,
+          s.market_cap,
+          s.trailing_eps,
+          s.ma50,
+          s.ma200,
+          s.trend_bullish,
+          s.rsi_oversold,
+          s.rsi_overbought,
+          p.p20_price,
+          p.p60_price,
+          p.avg_volume_60d,
+          f.revenue,
+          f.net_income,
+          f.free_cash_flow,
+          f.debt_to_equity,
+          f.roe
+        FROM warehouse.v_screener_latest s
+        LEFT JOIN LATERAL (
+          SELECT
+            max(close_price) FILTER (WHERE rn = 20) AS p20_price,
+            max(close_price) FILTER (WHERE rn = 60) AS p60_price,
+            avg(volume) FILTER (WHERE rn <= 60) AS avg_volume_60d
+          FROM (
+            SELECT close_price, volume,
+              row_number() OVER (ORDER BY full_date DESC) AS rn
+            FROM warehouse.v_price_series ps
+            WHERE ps.ticker = s.ticker
+          ) p
+        ) p ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT ff.revenue, ff.net_income, ff.free_cash_flow, ff.debt_to_equity, ff.roe
+          FROM warehouse.fact_financials ff
+          JOIN warehouse.dim_company c2 ON c2.company_id = ff.company_id
+          JOIN warehouse.dim_date d2 ON d2.date_id = ff.date_id
+          WHERE c2.ticker = s.ticker
+          ORDER BY d2.full_date DESC
+          LIMIT 1
+        ) f ON TRUE
         {where_sql}
-        ORDER BY score DESC NULLS LAST
-        LIMIT {limit};
+        ORDER BY s.market_cap DESC NULLS LAST
+        LIMIT {query_limit};
         """,
         *args,
     )
 
     out: List[RankingRow] = []
     for r in rows:
-        d = dict(r)
-        d["reasons"] = _normalize_json(d.get("reasons"))
-        out.append(RankingRow(**d))
-    return out
+        row = dict(r)
+
+        dividend_yield_pct = _normalize_dividend_yield(row.get("dividend_yield"))
+        trend_score, trend_source = _score_trend(
+            row.get("close_price"),
+            row.get("ma50"),
+            row.get("ma200"),
+            row.get("p20_price"),
+            row.get("p60_price"),
+        )
+
+        yield_score = _score_yield(dividend_yield_pct)
+        if disable_yield_before_ma200 and row.get("ma200") is None:
+            yield_score = None
+
+        scores = {
+            "trend": trend_score,
+            "rsi": _score_rsi(row.get("rsi14")),
+            "value": _score_value(row.get("pe_ratio"), row.get("trailing_eps"), exclude_negative_eps),
+            "size": _score_size(row.get("market_cap")),
+            "yield": yield_score,
+        }
+
+        available = {k: v is not None for k, v in scores.items()}
+        if disable_yield_before_ma200 and row.get("ma200") is None:
+            available["yield"] = False
+
+        normalized_weights = _normalize_weights(cfg.weights, available)
+        contributions = {
+            k: normalized_weights.get(k, 0.0) * scores[k]
+            for k in scores
+            if scores[k] is not None and k in normalized_weights
+        }
+        final_score = sum(contributions.values())
+
+        out.append(
+            RankingRow(
+                ticker=row.get("ticker"),
+                name=row.get("name"),
+                sector=row.get("sector"),
+                price_date=row.get("price_date"),
+                close_price=_to_float(row.get("close_price")),
+                rsi14=_to_float(row.get("rsi14")),
+                pe_ratio=_to_float(row.get("pe_ratio")),
+                dividend_yield=_to_float(row.get("dividend_yield")),
+                market_cap=_to_float(row.get("market_cap")),
+                score=final_score,
+                trend_score=trend_score,
+                rsi_score=scores["rsi"],
+                value_score=scores["value"],
+                size_score=scores["size"],
+                yield_score=yield_score,
+                normalized_weights=normalized_weights,
+                contributions=contributions,
+                trend_source=trend_source,
+                avg_volume_60d=_to_float(row.get("avg_volume_60d")),
+                profit_margin=_compute_profit_margin(row.get("revenue"), row.get("net_income")),
+                roe=_to_float(row.get("roe")),
+                debt_to_equity=_to_float(row.get("debt_to_equity")),
+                reasons={
+                    "trend_bullish": row.get("trend_bullish"),
+                    "trend_source": trend_source,
+                },
+            )
+        )
+
+    out.sort(key=lambda row: row.score or 0.0, reverse=True)
+    return out[:limit]
 
 # -------------------------
 # Data Quality Snapshot API

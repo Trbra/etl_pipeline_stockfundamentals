@@ -49,7 +49,7 @@ function colorForTicker(ticker: string) {
 
 function normalizeDividendYield(value?: number | null) {
   if (value == null) return null;
-  return value > 1.5 ? value : value * 100;
+  return Math.abs(value) > 5 ? value / 100 : value * 100;
 }
 
 export default function FundamentalsCompare({
