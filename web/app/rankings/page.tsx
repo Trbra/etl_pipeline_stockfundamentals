@@ -20,6 +20,7 @@ type RankingRow = {
   value_score?: number | null;
   size_score?: number | null;
   yield_score?: number | null;
+  quality_score?: number | null;
 
   normalized_weights?: Record<string, number>;
   contributions?: Record<string, number>;
@@ -30,6 +31,7 @@ type RankingRow = {
   debt_to_equity?: number | null;
 
   reasons: Record<string, any>;
+  sector_cap_applied?: boolean;
 };
 
 function formatDividendYield(value?: number | null) {
@@ -74,6 +76,7 @@ export default function RankingsPage() {
               <th className="p-3">Ticker</th>
               <th className="p-3">Name</th>
               <th className="p-3">Score</th>
+              <th className="p-3">Quality</th>
               <th className="p-3">Trend</th>
               <th className="p-3">RSI</th>
               <th className="p-3">P/E</th>
@@ -87,7 +90,8 @@ export default function RankingsPage() {
                 <td className="p-3 text-zinc-400">{idx + 1}</td>
                 <td className="p-3 font-semibold">{r.ticker}</td>
                 <td className="p-3 text-zinc-300">{r.name ?? ""}</td>
-                <td className="p-3 font-semibold">{r.score.toFixed(3)}</td>
+                <td className="p-3 font-semibold">{r.score != null ? r.score.toFixed(3) : "N/A"}</td>
+                <td className="p-3">{r.quality_score != null ? `${Math.round(r.quality_score * 100)}%` : "N/A"}</td>
                 <td className="p-3">{trendLabel(r.trend_score)}</td>
                 <td className="p-3">{r.rsi14 != null ? r.rsi14.toFixed(1) : "N/A"}</td>
                 <td className="p-3">{r.pe_ratio != null ? r.pe_ratio.toFixed(1) : "N/A"}</td>
@@ -98,15 +102,20 @@ export default function RankingsPage() {
                       Trend type: {r.trend_source === "long-term" ? "MA50/MA200" : "Short-term"}
                     </div>
                   ) : null}
-                  <div>
-                    {r.trend_score == null ? "Trend pending; " : r.reasons?.trend_bullish ? "MA50>MA200; " : ""}
-                    {r.rsi14 != null ? `RSI=${r.rsi14.toFixed(1)}; ` : ""}
-                    {r.pe_ratio != null ? `P/E=${r.pe_ratio.toFixed(1)}; ` : ""}
-                    {r.dividend_yield != null ? `Yield=${formatDividendYield(r.dividend_yield)}; ` : ""}
+                  <div className="text-xs">
+                    <div className="text-zinc-400">Sector: {r.sector ?? "Unknown"}</div>
+                    <div>
+                      {r.trend_score == null ? "Trend pending; " : r.reasons?.trend_bullish ? "MA50>MA200; " : ""}
+                      {r.rsi14 != null ? `RSI=${r.rsi14.toFixed(1)}; ` : ""}
+                      {r.pe_ratio != null ? `P/E=${r.pe_ratio.toFixed(1)}; ` : ""}
+                      {r.dividend_yield != null ? `Yield=${formatDividendYield(r.dividend_yield)}; ` : ""}
+                      {r.quality_score != null ? `Quality=${Math.round(r.quality_score * 100)}%; ` : ""}
+                    </div>
                   </div>
                   {r.normalized_weights ? (
                     <div className="mt-1 text-xs text-zinc-500">
                       W: T{(r.normalized_weights.trend ?? 0).toFixed(2)}
+                      &nbsp;Q{(r.normalized_weights.quality ?? 0).toFixed(2)}
                       &nbsp;R{(r.normalized_weights.rsi ?? 0).toFixed(2)}
                       &nbsp;V{(r.normalized_weights.value ?? 0).toFixed(2)}
                       &nbsp;S{(r.normalized_weights.size ?? 0).toFixed(2)}
@@ -116,11 +125,15 @@ export default function RankingsPage() {
                   {r.contributions ? (
                     <div className="text-xs text-zinc-500">
                       C: T{(r.contributions.trend ?? 0).toFixed(2)}
+                      &nbsp;Q{(r.contributions.quality ?? 0).toFixed(2)}
                       &nbsp;R{(r.contributions.rsi ?? 0).toFixed(2)}
                       &nbsp;V{(r.contributions.value ?? 0).toFixed(2)}
                       &nbsp;S{(r.contributions.size ?? 0).toFixed(2)}
                       &nbsp;Y{(r.contributions.yield ?? 0).toFixed(2)}
                     </div>
+                  ) : null}
+                  {r.sector_cap_applied ? (
+                    <div className="mt-1 text-xs text-amber-300">Notes: Sector cap applied</div>
                   ) : null}
                 </td>
               </tr>

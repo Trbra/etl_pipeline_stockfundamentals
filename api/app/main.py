@@ -131,6 +131,13 @@ class RankingRow(BaseModel):
     value_score: Optional[float] = None
     size_score: Optional[float] = None
     yield_score: Optional[float] = None
+    quality_score: Optional[float] = None
+    quality_factors: Optional[Dict[str, Optional[float]]] = None
+    score_raw: Optional[float] = None
+    missing_factors: Optional[List[str]] = None
+    sector_cap_applied: Optional[bool] = None
+    effective_weights: Optional[Dict[str, float]] = None
+    raw_values: Optional[Dict[str, Any]] = None
 
     normalized_weights: Optional[Dict[str, float]] = None
     contributions: Optional[Dict[str, float]] = None
@@ -309,11 +316,12 @@ async def get_ranking_config():
         return RankingConfig(
             name="default",
             weights={
-                "trend": 0.4,
-                "rsi": 0.25,
-                "value": 0.25,
-                "size": 0.1,
-                "yield": 0.0,
+                "trend": 0.40,
+                "quality": 0.25,
+                "value": 0.20,
+                "rsi": 0.10,
+                "size": 0.05,
+                "yield": 0.00,
             },
             params={
                 "min_market_cap": 2000000000,
@@ -321,6 +329,9 @@ async def get_ranking_config():
                 "exclude_negative_eps": False,
                 "rsi_min": 0.0,
                 "rsi_max": 100.0,
+                "max_per_sector": 3,
+                "sector_cap_top_n": 20,
+                "compression_gamma": 1.35,
                 "disable_yield_before_ma200": True,
             },
             active=True,
@@ -606,6 +617,94 @@ def _compute_profit_margin(revenue: Optional[float], net_income: Optional[float]
     return n / r
 
 
+def _score_quality(
+    revenue: Optional[float],
+    revenue_prev: Optional[float],
+    net_income: Optional[float],
+    net_income_prev: Optional[float],
+    free_cash_flow: Optional[float],
+    debt_to_equity: Optional[float],
+    roe: Optional[float],
+) -> tuple[Optional[float], Dict[str, Optional[float]]]:
+    """
+    Compute a composite quality score from fundamentals. Returns (score, detail_factors).
+    Each factor normalized to 0-1 where higher is better (for debt_to_equity lower is better).
+    """
+    # Helpers
+    def norm_growth(curr: Optional[float], prev: Optional[float]) -> Optional[float]:
+        c = _to_float(curr)
+        p = _to_float(prev)
+        if c is None or p is None or p == 0:
+            return None
+        g = (c - p) / abs(p)
+        # normalize growth -50%..+50% -> 0..1
+        return _clamp((g + 0.5) / 1.0, 0.0, 1.0)
+
+    def norm_positive(val: Optional[float]) -> Optional[float]:
+        v = _to_float(val)
+        if v is None:
+            return None
+        return 1.0 if v > 0 else 0.0
+
+    factors: Dict[str, Optional[float]] = {}
+
+    factors["revenue_growth"] = norm_growth(revenue, revenue_prev)
+    factors["net_income_growth"] = norm_growth(net_income, net_income_prev)
+
+    pm = _compute_profit_margin(revenue, net_income)
+    if pm is None:
+        factors["profit_margin"] = None
+    else:
+        if pm >= 0.2:
+            factors["profit_margin"] = 1.0
+        elif pm >= 0.1:
+            factors["profit_margin"] = 0.8
+        elif pm >= 0.05:
+            factors["profit_margin"] = 0.6
+        elif pm > 0:
+            factors["profit_margin"] = 0.4
+        else:
+            factors["profit_margin"] = 0.0
+
+    if roe is None:
+        factors["roe"] = None
+    else:
+        if roe >= 0.25:
+            factors["roe"] = 1.0
+        elif roe >= 0.15:
+            factors["roe"] = 0.8
+        elif roe >= 0.08:
+            factors["roe"] = 0.6
+        elif roe >= 0:
+            factors["roe"] = 0.4
+        else:
+            factors["roe"] = 0.0
+
+    if debt_to_equity is None:
+        factors["debt_to_equity"] = None
+    else:
+        d = _to_float(debt_to_equity)
+        if d <= 0.5:
+            factors["debt_to_equity"] = 1.0
+        elif d <= 1.0:
+            factors["debt_to_equity"] = 0.8
+        elif d <= 2.0:
+            factors["debt_to_equity"] = 0.6
+        elif d <= 3.0:
+            factors["debt_to_equity"] = 0.4
+        else:
+            factors["debt_to_equity"] = 0.2
+
+    factors["free_cash_flow_positive"] = norm_positive(free_cash_flow)
+
+    # Average available factors
+    vals = [v for v in factors.values() if v is not None]
+    if not vals:
+        return None, factors
+    score = sum(vals) / len(vals)
+    return _clamp(score, 0.0, 1.0), factors
+
+
 @app.get("/api/rankings", response_model=List[RankingRow])
 async def rankings(
     sector: Optional[str] = None,
@@ -677,6 +776,8 @@ async def rankings(
           p.avg_volume_60d,
           f.revenue,
           f.net_income,
+          fprev.revenue AS revenue_prev,
+          fprev.net_income AS net_income_prev,
           f.free_cash_flow,
           f.debt_to_equity,
           f.roe
@@ -702,9 +803,18 @@ async def rankings(
           ORDER BY d2.full_date DESC
           LIMIT 1
         ) f ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT ff2.revenue, ff2.net_income
+                    FROM warehouse.fact_financials ff2
+                    JOIN warehouse.dim_company c3 ON c3.company_id = ff2.company_id
+                    JOIN warehouse.dim_date d3 ON d3.date_id = ff2.date_id
+                    WHERE c3.ticker = s.ticker
+                    ORDER BY d3.full_date DESC
+                    OFFSET 1 LIMIT 1
+                ) fprev ON TRUE
         {where_sql}
-        ORDER BY s.market_cap DESC NULLS LAST
-        LIMIT {query_limit};
+                ORDER BY s.market_cap DESC NULLS LAST
+                LIMIT {query_limit};
         """,
         *args,
     )
@@ -726,12 +836,24 @@ async def rankings(
         if disable_yield_before_ma200 and row.get("ma200") is None:
             yield_score = None
 
+        # compute quality/fundamentals score
+        quality_score, quality_factors = _score_quality(
+            row.get("revenue"),
+            row.get("revenue_prev"),
+            row.get("net_income"),
+            row.get("net_income_prev"),
+            row.get("free_cash_flow"),
+            row.get("debt_to_equity"),
+            row.get("roe"),
+        )
+
         scores = {
             "trend": trend_score,
             "rsi": _score_rsi(row.get("rsi14")),
             "value": _score_value(row.get("pe_ratio"), row.get("trailing_eps"), exclude_negative_eps),
             "size": _score_size(row.get("market_cap")),
             "yield": yield_score,
+            "quality": quality_score,
         }
 
         available = {k: v is not None for k, v in scores.items()}
@@ -744,7 +866,9 @@ async def rankings(
             for k in scores
             if scores[k] is not None and k in normalized_weights
         }
-        final_score = sum(contributions.values())
+        final_score_raw = sum(contributions.values())
+
+        missing = [k for k, v in scores.items() if v is None]
 
         out.append(
             RankingRow(
@@ -757,12 +881,15 @@ async def rankings(
                 pe_ratio=_to_float(row.get("pe_ratio")),
                 dividend_yield=_to_float(row.get("dividend_yield")),
                 market_cap=_to_float(row.get("market_cap")),
-                score=final_score,
+                score=final_score_raw,
+                score_raw=final_score_raw,
                 trend_score=trend_score,
                 rsi_score=scores["rsi"],
                 value_score=scores["value"],
                 size_score=scores["size"],
                 yield_score=yield_score,
+                quality_score=quality_score,
+                quality_factors=quality_factors,
                 normalized_weights=normalized_weights,
                 contributions=contributions,
                 trend_source=trend_source,
@@ -770,6 +897,15 @@ async def rankings(
                 profit_margin=_compute_profit_margin(row.get("revenue"), row.get("net_income")),
                 roe=_to_float(row.get("roe")),
                 debt_to_equity=_to_float(row.get("debt_to_equity")),
+                missing_factors=missing,
+                effective_weights=normalized_weights,
+                raw_values={
+                    "revenue": _to_float(row.get("revenue")),
+                    "revenue_prev": _to_float(row.get("revenue_prev")),
+                    "net_income": _to_float(row.get("net_income")),
+                    "net_income_prev": _to_float(row.get("net_income_prev")),
+                    "free_cash_flow": _to_float(row.get("free_cash_flow")),
+                },
                 reasons={
                     "trend_bullish": row.get("trend_bullish"),
                     "trend_source": trend_source,
@@ -777,8 +913,43 @@ async def rankings(
             )
         )
 
-    out.sort(key=lambda row: row.score or 0.0, reverse=True)
-    return out[:limit]
+    # Apply compression and min-max scaling so scores are less compressed near 1.0
+    gamma = float(params.get("compression_gamma", 1.35))
+    # compute scaled values
+    scaled = [((r.score_raw or 0.0) ** gamma) for r in out]
+    mn = min(scaled) if scaled else 0.0
+    mx = max(scaled) if scaled else 1.0
+    if mx > mn:
+        for i, r in enumerate(out):
+            r.score = (scaled[i] - mn) / (mx - mn)
+    else:
+        for i, r in enumerate(out):
+            r.score = scaled[i]
+
+    # Enforce sector cap to avoid domination
+    max_per_sector = int(params.get("max_per_sector", 3))
+    selected: List[RankingRow] = []
+    excluded: List[RankingRow] = []
+    counts: Dict[str, int] = {}
+    sorted_rows = sorted(out, key=lambda rr: rr.score or 0.0, reverse=True)
+    for r in sorted_rows:
+        key = r.sector or "UNKNOWN"
+        cnt = counts.get(key, 0)
+        if cnt < max_per_sector:
+            selected.append(r)
+            counts[key] = cnt + 1
+            r.sector_cap_applied = False
+        else:
+            excluded.append(r)
+            r.sector_cap_applied = True
+
+    # Fill to requested limit using excluded if needed
+    final_rows: List[RankingRow] = selected[:limit]
+    if len(final_rows) < limit:
+        need = limit - len(final_rows)
+        final_rows.extend(excluded[:need])
+
+    return final_rows
 
 # -------------------------
 # Data Quality Snapshot API
